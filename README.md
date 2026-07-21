@@ -2,7 +2,7 @@
 
 [![Rust](https://img.shields.io/badge/Language-Rust-orange.svg?logo=rust)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-blue.svg)](#)
-[![Version](https://img.shields.io/badge/Version-0.6.3-green.svg)](https://github.com/azubar/SpreadSheet/releases)
+[![Version](https://img.shields.io/badge/Version-0.6.5-green.svg)](https://github.com/azubar/SpreadSheet/releases)
 [![License](https://img.shields.io/badge/License-MIT%20%7C%20SIL%20OFL-lightgrey.svg)](#ліцензії)
 
 **SpreadSheet** — високопродуктивна зовнішня компонента за технологією **Native API** (`AddInNative`), написана на Rust. Вона призначена для швидкого перетворення файлів табличних документів `*.mxl` (1С 8.х / BAS) та документів `*.pdf` на растрові зображення **JPEG** або **PNG**.
@@ -30,7 +30,7 @@
 
 | Назва (Eng) | Назва (Укр/Рус) | Тип | Доступ | Опис |
 |---|---|---|---|---|
-| **`Version`** | `Версия` | `Строка` | Читання | Повертає поточну версію компоненти, наприклад `"0.6.3"`. |
+| **`Version`** | `Версия` | `Строка` | Читання | Повертає поточну версію компоненти, наприклад `"0.6.5"`. |
 | **`Quality`** | `Качество` | `Число` | Читання/Запис | Якість стиснення JPEG, від `1` до `100` (типово `90`). Для PNG ігнорується. |
 | **`Scale`** | `Масштаб` | `Число` | Читання/Запис | Масштаб рендерингу у відсотках від вихідного документа, від `1` до `1000` (типово `100`). |
 | **`PageNumber`** | `НомерСтраницы` | `Число` | Читання/Запис | Сторінка PDF для конвертації. Якщо `0`, всі сторінки склеюються вертикально. |
