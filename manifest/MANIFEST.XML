@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bundle xmlns="http://v8.1c.ru/8.2/addin/bundle" name="SpreadSheet">
+    <component os="Windows" path="spreadsheet_x86_64.dll" type="native" arch="x86_64"/>
+    <component os="Windows" path="spreadsheet_i386.dll" type="native" arch="i386"/>
+    <component os="Linux" path="libspreadsheet_x86_64.so" type="native" arch="x86_64"/>
+</bundle>

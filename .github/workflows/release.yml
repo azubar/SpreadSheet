@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc, i686-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Тести
+        run: cargo test -p spreadsheet
+      - name: Збірка DLL x64
+        run: cargo build -p spreadsheet --release --target x86_64-pc-windows-msvc
+      - name: Збірка DLL x86 (32-біт)
+        run: cargo build -p spreadsheet --release --target i686-pc-windows-msvc
+      - name: Перейменування артефактів
+        run: |
+          mkdir out
+          copy target\x86_64-pc-windows-msvc\release\spreadsheet.dll out\spreadsheet_x86_64.dll
+          copy target\i686-pc-windows-msvc\release\spreadsheet.dll out\spreadsheet_i386.dll
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-dlls
+          path: out/*.dll
+          if-no-files-found: error
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Тести
+        run: cargo test -p spreadsheet
+      - name: Збірка SO
+        run: cargo build -p spreadsheet --release --target x86_64-unknown-linux-gnu
+      - name: Перейменування артефакту
+        run: |
+          mkdir out
+          cp target/x86_64-unknown-linux-gnu/release/libspreadsheet.so out/libspreadsheet_x86_64.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-so
+          path: out/*.so
+          if-no-files-found: error
+
+  release:
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-dlls
+          path: bundle
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-so
+          path: bundle
+      - name: Пакування компоненти (ZIP з MANIFEST.XML)
+        run: |
+          cp manifest/MANIFEST.XML bundle/
+          cd bundle
+          zip -r ../SpreadSheet.zip .
+      - name: Контрольні суми SHA-256
+        run: |
+          sha256sum SpreadSheet.zip bundle/spreadsheet_x86_64.dll \
+            bundle/spreadsheet_i386.dll bundle/libspreadsheet_x86_64.so \
+            | sed 's|bundle/||' > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Публікація релізу
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            SpreadSheet.zip
+            bundle/spreadsheet_x86_64.dll
+            bundle/spreadsheet_i386.dll
+            bundle/libspreadsheet_x86_64.so
+            SHA256SUMS.txt
+          generate_release_notes: true
