@@ -15,14 +15,33 @@ use std::rc::Rc;
 use ab_glyph::{Font, FontRef, GlyphId, PxScaleFont, ScaleFont};
 use tiny_skia::{Paint, Pixmap, Rect, Transform};
 
-use crate::mxl_parser::{Cell, CellFormat, Document, DrawingKind, FontSpec, LineSpec, Merge};
+use crate::mxl_parser::{
+    Cell, CellFormat, Document, DrawingKind, FontFamily, FontSpec, LineSpec, Merge,
+};
 
-// Встроенные шрифты: Liberation Sans (лицензия SIL OFL, см. fonts/LICENSE) —
-// метрически совместим с Arial, которым набраны документы 1С.
-static FONT_REGULAR: &[u8] = include_bytes!("../fonts/LiberationSans-Regular.ttf");
-static FONT_BOLD: &[u8] = include_bytes!("../fonts/LiberationSans-Bold.ttf");
-static FONT_ITALIC: &[u8] = include_bytes!("../fonts/LiberationSans-Italic.ttf");
-static FONT_BOLD_ITALIC: &[u8] = include_bytes!("../fonts/LiberationSans-BoldItalic.ttf");
+// Встроенные шрифты Liberation (лицензия SIL OFL, см. fonts/LICENSE) —
+// метрически совместимы со шрифтами документов 1С: Sans — с Arial, Serif —
+// с Times New Roman, Mono — с Courier New. Порядок: семейство × (обычный,
+// жирный, курсив, жирный курсив), последним — запасной шрифт.
+static FONT_FILES: [&[u8]; 13] = [
+    include_bytes!("../fonts/LiberationSans-Regular.ttf"),
+    include_bytes!("../fonts/LiberationSans-Bold.ttf"),
+    include_bytes!("../fonts/LiberationSans-Italic.ttf"),
+    include_bytes!("../fonts/LiberationSans-BoldItalic.ttf"),
+    include_bytes!("../fonts/LiberationSerif-Regular.ttf"),
+    include_bytes!("../fonts/LiberationSerif-Bold.ttf"),
+    include_bytes!("../fonts/LiberationSerif-Italic.ttf"),
+    include_bytes!("../fonts/LiberationSerif-BoldItalic.ttf"),
+    include_bytes!("../fonts/LiberationMono-Regular.ttf"),
+    include_bytes!("../fonts/LiberationMono-Bold.ttf"),
+    include_bytes!("../fonts/LiberationMono-Italic.ttf"),
+    include_bytes!("../fonts/LiberationMono-BoldItalic.ttf"),
+    // DejaVu Sans (см. fonts/LICENSE-DejaVu) — для символов, которых нет в
+    // Liberation (стрелки, математические и прочие знаки)
+    include_bytes!("../fonts/DejaVuSans.ttf"),
+];
+/// Индекс запасного шрифта в [`FONT_FILES`].
+const FALLBACK_FACE: usize = 12;
 
 /// Ширина колонки по умолчанию, 1/8 символа (9 символов, как в 1С)
 const DEFAULT_COL_WIDTH_UNITS: f32 = 72.0;
@@ -172,8 +191,8 @@ struct GlyphKey {
 const GLYPH_CACHE_LIMIT: usize = 20_000;
 
 struct Fonts<'a> {
-    /// regular, bold, italic, bold italic
-    faces: [FontRef<'a>; 4],
+    /// шрифты в порядке [`FONT_FILES`]
+    faces: Vec<FontRef<'a>>,
     /// Кэш растров глифов: документ набран несколькими шрифтами и
     /// размерами, поэтому одни и те же глифы растеризуются многократно.
     glyphs: RefCell<HashMap<GlyphKey, Option<Rc<GlyphBitmap>>>>,
@@ -183,23 +202,27 @@ impl<'a> Fonts<'a> {
     fn load() -> Result<Fonts<'a>, String> {
         let load = |data| FontRef::try_from_slice(data).map_err(|e| format!("шрифт: {e}"));
         Ok(Fonts {
-            faces: [
-                load(FONT_REGULAR)?,
-                load(FONT_BOLD)?,
-                load(FONT_ITALIC)?,
-                load(FONT_BOLD_ITALIC)?,
-            ],
+            faces: FONT_FILES
+                .iter()
+                .map(|data| load(data))
+                .collect::<Result<_, _>>()?,
             glyphs: RefCell::new(HashMap::new()),
         })
     }
 
     fn face_index(spec: &FontSpec) -> usize {
-        match (spec.bold, spec.italic) {
-            (false, false) => 0,
-            (true, false) => 1,
-            (false, true) => 2,
-            (true, true) => 3,
-        }
+        let family = match spec.family {
+            FontFamily::Sans => 0,
+            FontFamily::Serif => 4,
+            FontFamily::Mono => 8,
+        };
+        family
+            + match (spec.bold, spec.italic) {
+                (false, false) => 0,
+                (true, false) => 1,
+                (false, true) => 2,
+                (true, true) => 3,
+            }
     }
 
     fn pick(&self, spec: &FontSpec) -> &FontRef<'a> {
@@ -211,6 +234,7 @@ impl<'a> Fonts<'a> {
         ScaledFace {
             face: Self::face_index(spec) as u8,
             font: self.pick(spec).as_scaled(px),
+            fallback: self.faces[FALLBACK_FACE].as_scaled(px),
         }
     }
 
@@ -219,15 +243,20 @@ impl<'a> Fonts<'a> {
     fn glyph_bitmap(
         &self,
         sf: &ScaledFace,
-        id: GlyphId,
+        (fallback, id): FaceGlyph,
         x: f32,
         y: f32,
     ) -> (Option<Rc<GlyphBitmap>>, f32, f32) {
         let (trunc_x, fract_x) = (x.trunc(), x.fract());
         let (trunc_y, fract_y) = (y.trunc(), y.fract());
-        let scale = sf.font.scale();
+        let font = sf.font_of(fallback);
+        let scale = font.scale();
         let key = GlyphKey {
-            face: sf.face,
+            face: if fallback {
+                FALLBACK_FACE as u8
+            } else {
+                sf.face
+            },
             glyph: id.0,
             scale_x: scale.x.to_bits(),
             scale_y: scale.y.to_bits(),
@@ -240,7 +269,7 @@ impl<'a> Fonts<'a> {
         // Растеризация в позиции, равной дробной части: результат совпадает
         // с растеризацией в исходной позиции со сдвигом на целую часть.
         let glyph = id.with_scale_and_position(scale, ab_glyph::point(fract_x, fract_y));
-        let bitmap = sf.font.font().outline_glyph(glyph).map(|outlined| {
+        let bitmap = font.font().outline_glyph(glyph).map(|outlined| {
             let bounds = outlined.px_bounds();
             let w = bounds.width() as usize;
             let h = bounds.height() as usize;
@@ -264,10 +293,50 @@ impl<'a> Fonts<'a> {
     }
 }
 
-/// Шрифт конкретного начертания в конкретном масштабе.
+/// Глиф с признаком «из запасного шрифта».
+type FaceGlyph = (bool, GlyphId);
+
+/// Шрифт конкретного начертания в конкретном масштабе (с запасным шрифтом
+/// того же размера). Метрики строки (`ascent`, `descent`) — основного шрифта.
 struct ScaledFace<'f, 'a> {
     face: u8,
     font: PxScaleFont<&'f FontRef<'a>>,
+    fallback: PxScaleFont<&'f FontRef<'a>>,
+}
+
+impl<'f, 'a> ScaledFace<'f, 'a> {
+    /// Глиф символа: из основного шрифта, а если там его нет — из запасного.
+    fn glyph(&self, ch: char) -> FaceGlyph {
+        let id = self.font.glyph_id(ch);
+        if id.0 == 0 && !ch.is_whitespace() {
+            let fid = self.fallback.glyph_id(ch);
+            if fid.0 != 0 {
+                return (true, fid);
+            }
+        }
+        (false, id)
+    }
+
+    fn font_of(&self, fallback: bool) -> &PxScaleFont<&'f FontRef<'a>> {
+        if fallback {
+            &self.fallback
+        } else {
+            &self.font
+        }
+    }
+
+    /// Кернинг пары глифов (только внутри одного шрифта).
+    fn kern(&self, prev: FaceGlyph, next: FaceGlyph) -> f32 {
+        if prev.0 == next.0 {
+            self.font_of(next.0).kern(prev.1, next.1)
+        } else {
+            0.0
+        }
+    }
+
+    fn h_advance(&self, g: FaceGlyph) -> f32 {
+        self.font_of(g.0).h_advance(g.1)
+    }
 }
 
 impl<'f, 'a> std::ops::Deref for ScaledFace<'f, 'a> {
@@ -290,11 +359,11 @@ fn line_height(fonts: &Fonts, spec: &FontSpec, scale: f32) -> f32 {
 }
 
 /// Состояние измерения строки: ширина и последний глиф (для кернинга).
-type Measure = (f32, Option<GlyphId>);
+type Measure = (f32, Option<FaceGlyph>);
 
 /// Продолжает измерение ширины строки с состояния `state` на `text`.
 /// Измерение строки целиком и по частям даёт одинаковый результат.
-fn measure_more<SF: ScaleFont<F>, F: Font>(f: &SF, state: Measure, text: &str) -> Measure {
+fn measure_more(f: &ScaledFace, state: Measure, text: &str) -> Measure {
     let (mut w, mut prev) = state;
     for ch in text.chars() {
         // управляющие символы (табуляция, возврат каретки и пр.) не имеют
@@ -303,25 +372,25 @@ fn measure_more<SF: ScaleFont<F>, F: Font>(f: &SF, state: Measure, text: &str) -
             prev = None;
             continue;
         }
-        let id = f.glyph_id(ch);
+        let g = f.glyph(ch);
         if let Some(p) = prev {
-            w += f.kern(p, id);
+            w += f.kern(p, g);
         }
-        w += f.h_advance(id);
-        prev = Some(id);
+        w += f.h_advance(g);
+        prev = Some(g);
     }
     (w, prev)
 }
 
 fn text_width(fonts: &Fonts, spec: &FontSpec, scale: f32, text: &str) -> f32 {
-    let f = fonts.pick(spec).as_scaled(font_px(spec, scale));
+    let f = fonts.scaled(spec, font_px(spec, scale));
     measure_more(&f, (0.0, None), text).0
 }
 
 /// Перенос текста по словам под заданную ширину. Ширина строки-кандидата
 /// наращивается по словам, а не пересчитывается целиком (линейное время).
 fn wrap_text(fonts: &Fonts, spec: &FontSpec, scale: f32, text: &str, max_w: f32) -> Vec<String> {
-    let f = fonts.pick(spec).as_scaled(font_px(spec, scale));
+    let f = fonts.scaled(spec, font_px(spec, scale));
     let mut lines = Vec::new();
     for raw_line in text.split('\n') {
         let raw_line = raw_line.trim_end_matches('\r');
@@ -523,21 +592,7 @@ fn build_layout(
     scale: f32,
 ) -> Result<Layout, String> {
     // размер таблицы
-    let mut ncols: u32 = 1;
-    let mut nrows: u32 = 1;
-    for row in &doc.rows {
-        nrows = nrows.max(row.index.saturating_add(1));
-        for (col, _) in &row.cells {
-            ncols = ncols.max(col.saturating_add(1));
-        }
-    }
-    for m in &doc.merges {
-        nrows = nrows.max(m.bottom.saturating_add(1));
-        ncols = ncols.max(m.right.saturating_add(1));
-    }
-    for (col, _) in &doc.default_group.columns {
-        ncols = ncols.max(col.saturating_add(1));
-    }
+    let (nrows, ncols) = table_size(doc);
     // Каждая строка занимает не меньше 1 px, поэтому строк больше
     // MAX_DIMENSION картинка вместить не может. Проверка — до раскладки:
     // номер строки из повреждённого файла (например, 2·10⁹) иначе приводит
@@ -724,7 +779,6 @@ fn build_layout(
     }
     let width_px = (content_right.ceil() as u32).saturating_add(2);
     let height_px = (*row_y.last().unwrap() as u32).saturating_add(2);
-    check_image_size(width_px as u64, height_px as u64, "уменьшите Масштаб")?;
     Ok(Layout {
         group_x,
         row_group_idx,
@@ -758,14 +812,131 @@ pub fn render(doc: &Document, scale_percent: u32) -> Result<Pixmap, String> {
     let fonts = Fonts::load()?;
     let prep = Prepared::new(doc)?;
     let layout = build_layout(doc, &fonts, &prep, scale)?;
+    check_image_size(
+        layout.width_px as u64,
+        layout.height_px as u64,
+        "уменьшите Масштаб или выберите одну страницу (НомерСтраницы)",
+    )?;
+    draw_layout(doc, &fonts, &prep, &layout)
+}
+
+/// Страница документа: диапазоны строк и колонок (0-базные, включительно).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageRange {
+    pub rows: (u32, u32),
+    pub cols: (u32, u32),
+}
+
+/// Делит отрезок `[from, to]` на части после позиций `breaks`.
+fn split_by_breaks(from: u32, to: u32, breaks: &[u32]) -> Vec<(u32, u32)> {
+    let mut parts = Vec::new();
+    let mut start = from;
+    for &b in breaks {
+        if b >= start && b < to {
+            parts.push((start, b));
+            start = b + 1;
+        }
+    }
+    parts.push((start, to));
+    parts
+}
+
+/// Число строк и колонок таблицы (по ячейкам, объединениям и колонкам).
+fn table_size(doc: &Document) -> (u32, u32) {
+    let mut ncols: u32 = 1;
+    let mut nrows: u32 = 1;
+    for row in &doc.rows {
+        nrows = nrows.max(row.index.saturating_add(1));
+        for (col, _) in &row.cells {
+            ncols = ncols.max(col.saturating_add(1));
+        }
+    }
+    for m in &doc.merges {
+        nrows = nrows.max(m.bottom.saturating_add(1));
+        ncols = ncols.max(m.right.saturating_add(1));
+    }
+    for (col, _) in &doc.default_group.columns {
+        ncols = ncols.max(col.saturating_add(1));
+    }
+    (nrows, ncols)
+}
+
+/// Страницы документа для печати: область печати (а без неё — вся
+/// таблица), разделённая явными горизонтальными и вертикальными разрывами
+/// страниц. Порядок страниц — «сначала вниз, затем вправо». Автоматическое
+/// разбиение по размеру листа бумаги не выполняется.
+pub fn pages(doc: &Document) -> Vec<PageRange> {
+    let (nrows, ncols) = table_size(doc);
+    let area = doc.print_area.unwrap_or_default();
+    // граница области за пределами таблицы ограничивается таблицей
+    let top = area.top.unwrap_or(0).min(nrows - 1);
+    let bottom = area.bottom.unwrap_or(nrows - 1).min(nrows - 1).max(top);
+    let left = area.left.unwrap_or(0).min(ncols - 1);
+    let right = area.right.unwrap_or(ncols - 1).min(ncols - 1).max(left);
+    let row_parts = split_by_breaks(top, bottom, &doc.row_breaks());
+    let col_parts = split_by_breaks(left, right, &doc.column_breaks());
+    col_parts
+        .iter()
+        .flat_map(|&cols| row_parts.iter().map(move |&rows| PageRange { rows, cols }))
+        .collect()
+}
+
+/// Рендерит страницу `page_number` (с 1) документа (см. [`pages`]).
+/// Раскладка строится для всего документа, но рисуется только окно
+/// страницы: память нужна лишь под картинку страницы, а содержимое на
+/// границе страницы (объединения, выпущенный текст) обрезается так же, как
+/// при печати.
+pub fn render_page(doc: &Document, scale_percent: u32, page_number: u32) -> Result<Pixmap, String> {
+    let all = pages(doc);
+    let page = page_number
+        .checked_sub(1)
+        .and_then(|i| all.get(i as usize))
+        .ok_or_else(|| {
+            format!(
+                "запрошена страница {page_number}, но в документе всего {} стр.",
+                all.len()
+            )
+        })?;
+    let scale = scale_percent as f32 / 100.0;
+    let fonts = Fonts::load()?;
+    let prep = Prepared::new(doc)?;
+    let mut layout = build_layout(doc, &fonts, &prep, scale)?;
+    // поле 1 px слева/сверху и 2 px справа/снизу под рамки — как у всего
+    // документа
+    let x0 = layout.group_x[0][page.cols.0 as usize] - 1.0;
+    let x1 = layout.group_x[0][page.cols.1 as usize + 1] + 2.0;
+    let y0 = layout.row_y[page.rows.0 as usize] - 1.0;
+    let y1 = layout.row_y[page.rows.1 as usize + 1] + 2.0;
+    let (w, h) = ((x1 - x0).ceil().max(1.0), (y1 - y0).ceil().max(1.0));
+    check_image_size(w as u64, h as u64, "уменьшите Масштаб")?;
+    for xs in &mut layout.group_x {
+        for x in xs.iter_mut() {
+            *x -= x0;
+        }
+    }
+    for y in &mut layout.row_y {
+        *y -= y0;
+    }
+    layout.width_px = w as u32;
+    layout.height_px = h as u32;
+    draw_layout(doc, &fonts, &prep, &layout)
+}
+
+/// Рисует документ по готовой раскладке в буфер размера раскладки.
+fn draw_layout(
+    doc: &Document,
+    fonts: &Fonts,
+    prep: &Prepared,
+    layout: &Layout,
+) -> Result<Pixmap, String> {
     let mut pixmap = Pixmap::new(layout.width_px, layout.height_px)
         .ok_or_else(|| "не удалось создать буфер изображения".to_string())?;
     pixmap.fill(tiny_skia::Color::WHITE);
 
-    draw_backgrounds(doc, &layout, &prep, &mut pixmap);
-    draw_borders(doc, &layout, &prep, &mut pixmap);
-    draw_texts(doc, &fonts, &layout, &prep, &mut pixmap);
-    draw_drawings(doc, &fonts, &layout, &mut pixmap);
+    draw_backgrounds(doc, layout, prep, &mut pixmap);
+    draw_borders(doc, layout, prep, &mut pixmap);
+    draw_texts(doc, fonts, layout, prep, &mut pixmap);
+    draw_drawings(doc, fonts, layout, &mut pixmap);
     Ok(pixmap)
 }
 
@@ -869,34 +1040,51 @@ fn draw_drawings(doc: &Document, fonts: &Fonts, layout: &Layout, pixmap: &mut Pi
     }
 }
 
-/// Копирует растровую картинку в прямоугольник (грубое масштабирование
-/// по ближайшему пикселю, альфа-смешивание).
+/// Вписывает растровую картинку в прямоугольник с альфа-смешиванием.
+/// Масштабирование — с фильтрацией: при уменьшении треугольный фильтр
+/// (без «лестницы» и потери тонких линий печатей и логотипов), при
+/// увеличении — Catmull-Rom (без «квадратиков» ближайшего соседа).
 fn blit_image(pixmap: &mut Pixmap, rgba: &image::RgbaImage, x0: f32, y0: f32, x1: f32, y1: f32) {
-    let width = pixmap.width() as i32;
-    let height = pixmap.height() as i32;
     let (tw, th) = (x1 - x0, y1 - y0);
-    if tw < 1.0 || th < 1.0 {
+    if tw < 1.0 || th < 1.0 || rgba.width() == 0 || rgba.height() == 0 {
         return;
     }
+    let (w, h) = (tw.round() as u32, th.round() as u32);
+    // картинка много больше листа (повреждённые смещения) — не рисуем:
+    // масштабирование заняло бы непропорционально много памяти и времени
+    let page_area = pixmap.width() as u64 * pixmap.height() as u64;
+    if w as u64 * h as u64 > (4 * page_area).min(MAX_PIXELS) {
+        return;
+    }
+    let scaled;
+    let src = if (w, h) == rgba.dimensions() {
+        rgba
+    } else {
+        let filter = if w < rgba.width() || h < rgba.height() {
+            image::imageops::FilterType::Triangle
+        } else {
+            image::imageops::FilterType::CatmullRom
+        };
+        scaled = image::imageops::resize(rgba, w, h, filter);
+        &scaled
+    };
+    let width = pixmap.width() as i32;
+    let height = pixmap.height() as i32;
+    let (ox, oy) = (x0.round() as i32, y0.round() as i32);
     let data = pixmap.data_mut();
-    let (px0, py0) = (x0.max(0.0) as i32, y0.max(0.0) as i32);
-    let (px1, py1) = ((x1 as i32).min(width), (y1 as i32).min(height));
-    for py in py0..py1 {
-        let sy = ((py as f32 - y0) / th * rgba.height() as f32) as u32;
-        let sy = sy.min(rgba.height() - 1);
-        for px in px0..px1 {
-            let sx = ((px as f32 - x0) / tw * rgba.width() as f32) as u32;
-            let sx = sx.min(rgba.width() - 1);
-            let p = rgba.get_pixel(sx, sy).0;
-            let a = p[3] as u16;
-            if a == 0 {
-                continue;
-            }
-            let idx = (py as usize * width as usize + px as usize) * 4;
-            for (offset, src) in p[..3].iter().enumerate() {
-                let old = data[idx + offset] as u16;
-                data[idx + offset] = ((old * (255 - a) + *src as u16 * a) / 255) as u8;
-            }
+    for (sx, sy, p) in src.enumerate_pixels() {
+        let (px, py) = (ox + sx as i32, oy + sy as i32);
+        if px < 0 || py < 0 || px >= width || py >= height {
+            continue;
+        }
+        let a = p[3] as u16;
+        if a == 0 {
+            continue;
+        }
+        let idx = (py as usize * width as usize + px as usize) * 4;
+        for (offset, src) in p.0[..3].iter().enumerate() {
+            let old = data[idx + offset] as u16;
+            data[idx + offset] = ((old * (255 - a) + *src as u16 * a) / 255) as u8;
         }
     }
 }
@@ -1403,11 +1591,11 @@ fn draw_line_of_text(
             prev = None;
             continue;
         }
-        let id = scaled.glyph_id(ch);
+        let g = scaled.glyph(ch);
         if let Some(p) = prev {
-            x += scaled.kern(p, id);
+            x += scaled.kern(p, g);
         }
-        let (bitmap, base_x, base_y) = fonts.glyph_bitmap(scaled, id, x, baseline);
+        let (bitmap, base_x, base_y) = fonts.glyph_bitmap(scaled, g, x, baseline);
         if let Some(bitmap) = bitmap {
             let min_x = (base_x + bitmap.min_x) as i32;
             let min_y = (base_y + bitmap.min_y) as i32;
@@ -1425,8 +1613,8 @@ fn draw_line_of_text(
                 blend_pixel(data, width as usize, px, py, cov, color);
             }
         }
-        x += scaled.h_advance(id);
-        prev = Some(id);
+        x += scaled.h_advance(g);
+        prev = Some(g);
     }
 }
 
@@ -1497,13 +1685,13 @@ fn draw_line_of_text_rotated(
             prev = None;
             continue;
         }
-        let id = scaled.glyph_id(ch);
+        let g = scaled.glyph(ch);
         if let Some(p) = prev {
-            pen += scaled.kern(p, id);
+            pen += scaled.kern(p, g);
         }
         // глиф раскладывается в «горизонтальном» пространстве от (pen, 0),
         // затем каждый пиксель поворачивается: (dx, dy) → (dy, -dx)
-        let (bitmap, base_x, base_y) = fonts.glyph_bitmap(scaled, id, pen, 0.0);
+        let (bitmap, base_x, base_y) = fonts.glyph_bitmap(scaled, g, pen, 0.0);
         if let Some(bitmap) = bitmap {
             let min_x = base_x + bitmap.min_x;
             let min_y = base_y + bitmap.min_y;
@@ -1523,8 +1711,8 @@ fn draw_line_of_text_rotated(
                 blend_pixel(data, width as usize, tx, ty, cov, color);
             }
         }
-        pen += scaled.h_advance(id);
-        prev = Some(id);
+        pen += scaled.h_advance(g);
+        prev = Some(g);
     }
 }
 
@@ -1640,7 +1828,7 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mxl_parser::{parse_file, FontSpec, Merge, Row};
+    use crate::mxl_parser::{parse_file, FontFamily, FontSpec, Merge, Row};
     use std::path::PathBuf;
 
     fn mxl(name: &str) -> PathBuf {
@@ -2307,5 +2495,196 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("не удалось создать файл"), "{e}");
+    }
+
+    fn demo_doc(name: &str) -> Document {
+        parse_file(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../mxl-demo-collection")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn split_by_breaks_ignores_breaks_outside_range() {
+        assert_eq!(split_by_breaks(0, 10, &[]), vec![(0, 10)]);
+        assert_eq!(
+            split_by_breaks(0, 10, &[3, 7]),
+            vec![(0, 3), (4, 7), (8, 10)]
+        );
+        // разрыв на последней строке и вне диапазона — не делит
+        assert_eq!(split_by_breaks(2, 10, &[1, 10, 15]), vec![(2, 10)]);
+    }
+
+    #[test]
+    fn pages_follow_print_area_and_breaks() {
+        let doc = demo_doc("ДемонстрацияПечатиРазрывов_A4_Книжная.mxl");
+        let all = pages(&doc);
+        assert_eq!(
+            all,
+            vec![
+                PageRange {
+                    rows: (0, 24),
+                    cols: (0, 11)
+                },
+                PageRange {
+                    rows: (25, 35),
+                    cols: (0, 11)
+                },
+                PageRange {
+                    rows: (36, 48),
+                    cols: (0, 11)
+                },
+            ]
+        );
+        let full = render(&doc, 100).unwrap();
+        let heights: Vec<u32> = (1..=3)
+            .map(|n| {
+                let p = render_page(&doc, 100, n).unwrap();
+                assert_eq!(p.width(), full.width(), "страница {n}");
+                p.height()
+            })
+            .collect();
+        // страницы вместе покрывают документ (у каждой поля 1 + 2 px)
+        assert_eq!(heights.iter().sum::<u32>(), full.height() + 2 * 3);
+        let e = render_page(&doc, 100, 4).unwrap_err();
+        assert!(e.contains("всего 3 стр."), "{e}");
+        assert!(render_page(&doc, 100, 0).is_err());
+    }
+
+    #[test]
+    fn page_is_a_crop_of_the_full_render() {
+        let doc = demo_doc("ДемонстрацияПечатиРазрывов_A4_Книжная.mxl");
+        let full = render(&doc, 100).unwrap();
+        let page = render_page(&doc, 100, 2).unwrap();
+        // строка 26 (индекс 25) начинается на row_y[25]; страница — с поля 1 px
+        let fonts = Fonts::load().unwrap();
+        let prep = Prepared::new(&doc).unwrap();
+        let layout = build_layout(&doc, &fonts, &prep, 1.0).unwrap();
+        let top = layout.row_y[25] as u32 - 1;
+        let w = full.width() as usize * 4;
+        // внутренние строки страницы совпадают с полной картинкой; глифы
+        // могут отличаться на 1–2 единицы яркости — базовая линия текста на
+        // странице сдвинута на целое число px, но считается во float с
+        // другим округлением дробной части
+        let mut max_diff = 0u8;
+        let mut differing = 0usize;
+        for y in 3..page.height() - 3 {
+            let src = &full.data()[(top + y) as usize * w..][..w];
+            let dst = &page.data()[y as usize * w..][..w];
+            for (a, b) in src.iter().zip(dst) {
+                max_diff = max_diff.max(a.abs_diff(*b));
+                differing += (a != b) as usize;
+            }
+        }
+        assert!(max_diff <= 2, "максимальное отличие {max_diff}");
+        assert!(differing < 500, "отличающихся значений {differing}");
+    }
+
+    #[test]
+    fn document_without_print_area_is_one_page() {
+        let doc = synthetic_doc();
+        assert_eq!(pages(&doc).len(), 1);
+        let p = render_page(&doc, 100, 1).unwrap();
+        let full = render(&doc, 100).unwrap();
+        assert_eq!((p.width(), p.height()), (full.width(), full.height()));
+    }
+
+    #[test]
+    fn page_of_a_document_too_large_for_one_image() {
+        // 6000 строк с разрывом через каждые 100: целиком не помещается,
+        // постранично — помещается
+        let mut doc = Document {
+            formats: vec![CellFormat {
+                width: Some(4),
+                ..CellFormat::default()
+            }],
+            ..Document::default()
+        };
+        for r in 0..6000 {
+            doc.rows.push(Row {
+                index: r,
+                format: if r % 100 == 99 { 1 } else { 0 },
+                cells: vec![(
+                    0,
+                    Cell {
+                        format: 0,
+                        text: Some(format!("строка {r}")),
+                    },
+                )],
+            });
+        }
+        assert!(render(&doc, 100).unwrap_err().contains("НомерСтраницы"));
+        assert_eq!(pages(&doc).len(), 60);
+        let p = render_page(&doc, 100, 60).unwrap();
+        assert!(p.height() < 3000, "{}", p.height());
+    }
+
+    #[test]
+    fn font_families_and_fallback_glyphs() {
+        let fonts = Fonts::load().unwrap();
+        let mono = FontSpec {
+            family: FontFamily::Mono,
+            ..FontSpec::default()
+        };
+        // моноширинный: одинаковая ширина узких и широких букв
+        let narrow = text_width(&fonts, &mono, 1.0, "iiii");
+        let wide = text_width(&fonts, &mono, 1.0, "MMMM");
+        assert!((narrow - wide).abs() < 0.01, "{narrow} != {wide}");
+        let sans = FontSpec::default();
+        assert!(text_width(&fonts, &sans, 1.0, "iiii") < text_width(&fonts, &sans, 1.0, "MMMM"));
+        let serif = FontSpec {
+            family: FontFamily::Serif,
+            ..FontSpec::default()
+        };
+        assert_ne!(
+            text_width(&fonts, &serif, 1.0, "Счёт на оплату"),
+            text_width(&fonts, &sans, 1.0, "Счёт на оплату")
+        );
+        // символа «✓» нет в Liberation — берётся из запасного шрифта
+        let sf = fonts.scaled(&sans, 20.0);
+        assert!(sf.glyph('✓').0, "✓ должен браться из запасного шрифта");
+        assert!(!sf.glyph('Ж').0);
+        assert!(text_width(&fonts, &sans, 1.0, "✓") > 1.0);
+    }
+
+    #[test]
+    fn fallback_glyph_is_drawn() {
+        let mut doc = synthetic_doc();
+        doc.rows[0].cells[0].1.text = Some("✓✓✓".to_string());
+        let pm = render(&doc, 300).unwrap();
+        let dark = pm.data().chunks_exact(4).filter(|p| p[0] < 100).count();
+        // рамка + глифы (без запасного шрифта рисовались бы пустые .notdef)
+        let mut empty = synthetic_doc();
+        empty.rows[0].cells[0].1.text = None;
+        let frame = render(&empty, 300)
+            .unwrap()
+            .data()
+            .chunks_exact(4)
+            .filter(|p| p[0] < 100)
+            .count();
+        assert!(dark > frame + 100, "глифов нет: {dark} vs {frame}");
+    }
+
+    #[test]
+    fn picture_downscaling_is_filtered() {
+        // шахматная доска 1 px, уменьшенная вдвое, даёт серый, а не
+        // чёрный/белый (как при выборке ближайшего пикселя)
+        let board = image::RgbaImage::from_fn(64, 64, |x, y| {
+            if (x + y) % 2 == 0 {
+                image::Rgba([0, 0, 0, 255])
+            } else {
+                image::Rgba([255, 255, 255, 255])
+            }
+        });
+        let mut pm = Pixmap::new(40, 40).unwrap();
+        pm.fill(tiny_skia::Color::WHITE);
+        blit_image(&mut pm, &board, 4.0, 4.0, 36.0, 36.0);
+        let i = ((20 * 40 + 20) * 4) as usize;
+        let v = pm.data()[i];
+        assert!((60..=200).contains(&v), "ожидался серый, получено {v}");
+        // за пределами картинки — фон
+        assert_eq!(pm.data()[0], 255);
     }
 }

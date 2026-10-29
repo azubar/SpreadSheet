@@ -210,8 +210,65 @@ pub struct CellFormat {
     pub orientation: Option<u32>,
 }
 
+/// Семейство шрифта для рендера: имя шрифта из документа сводится к одному
+/// из встроенных метрически совместимых семейств Liberation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FontFamily {
+    /// Без засечек: Arial, Tahoma, Verdana, Calibri и др. (Liberation Sans)
+    #[default]
+    Sans,
+    /// С засечками: Times New Roman, Georgia и др. (Liberation Serif)
+    Serif,
+    /// Моноширинный: Courier New, Consolas и др. (Liberation Mono)
+    Mono,
+}
+
+impl FontFamily {
+    /// Семейство по имени шрифта из документа.
+    pub fn from_name(name: &str) -> FontFamily {
+        let n = name.to_lowercase();
+        const MONO: [&str; 10] = [
+            "courier",
+            "consolas",
+            "mono",
+            "lucida console",
+            "fixedsys",
+            "terminal",
+            "monaco",
+            "menlo",
+            "inconsolata",
+            "source code",
+        ];
+        const SERIF: [&str; 12] = [
+            "times",
+            "georgia",
+            "cambria",
+            "garamond",
+            "antiqua",
+            "palatino",
+            "bookman",
+            "century",
+            "constantia",
+            "baskerville",
+            "tinos",
+            "pt serif",
+        ];
+        if MONO.iter().any(|m| n.contains(m)) {
+            FontFamily::Mono
+        } else if SERIF.iter().any(|m| n.contains(m))
+            || (n.contains("serif") && !n.contains("sans"))
+        {
+            FontFamily::Serif
+        } else {
+            FontFamily::Sans
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FontSpec {
+    /// Семейство (по имени шрифта)
+    pub family: FontFamily,
     /// Размер в десятых долях пункта (80 = 8 pt)
     pub size_tenth_pt: u32,
     pub bold: bool,
@@ -223,6 +280,7 @@ pub struct FontSpec {
 impl Default for FontSpec {
     fn default() -> Self {
         FontSpec {
+            family: FontFamily::Sans,
             size_tenth_pt: 80,
             bold: false,
             italic: false,
@@ -317,8 +375,24 @@ pub struct Drawing {
     pub picture: Option<u32>,
 }
 
+/// Область печати: границы включительно, 0-базные; `None` — граница не
+/// ограничена (область вида «строки» или «колонки»).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PrintArea {
+    pub left: Option<u32>,
+    pub top: Option<u32>,
+    pub right: Option<u32>,
+    pub bottom: Option<u32>,
+}
+
+/// Признак разрыва страницы в формате строки/колонки (значение поля
+/// «другого измерения»: ширины для строки, высоты для колонки).
+const PAGE_BREAK_FLAG: u32 = 4;
+
 #[derive(Debug, Default)]
 pub struct Document {
+    /// Область печати документа
+    pub print_area: Option<PrintArea>,
     pub rows: Vec<Row>,
     /// Таблица форматов; индексы из ячеек 1-базные: ячейка с format = i
     /// ссылается на formats[i-1]
@@ -361,6 +435,45 @@ impl Document {
             Some(ColorSpec::Rgb(r, g, b)) => Some((*r, *g, *b)),
             _ => None,
         }
+    }
+
+    /// Горизонтальные разрывы страниц: номера строк (0-базные), после
+    /// которых начинается новая страница. В файле разрыв хранится в формате
+    /// строки как значение поля ширины с битом 4.
+    pub fn row_breaks(&self) -> Vec<u32> {
+        let mut breaks: Vec<u32> = self
+            .rows
+            .iter()
+            .filter(|r| {
+                self.format(r.format)
+                    .and_then(|f| f.width)
+                    .is_some_and(|w| w & PAGE_BREAK_FLAG != 0)
+            })
+            .map(|r| r.index)
+            .collect();
+        breaks.sort_unstable();
+        breaks.dedup();
+        breaks
+    }
+
+    /// Вертикальные разрывы страниц: номера колонок (0-базные), после
+    /// которых начинается новая страница (поле высоты в формате колонки
+    /// группы по умолчанию с битом 4).
+    pub fn column_breaks(&self) -> Vec<u32> {
+        let mut breaks: Vec<u32> = self
+            .default_group
+            .columns
+            .iter()
+            .filter(|(_, fmt)| {
+                self.format(*fmt)
+                    .and_then(|f| f.height)
+                    .is_some_and(|h| h & PAGE_BREAK_FLAG != 0)
+            })
+            .map(|(col, _)| *col)
+            .collect();
+        breaks.sort_unstable();
+        breaks.dedup();
+        breaks
     }
 
     /// Группа колонок, действующая для строки.
@@ -602,6 +715,10 @@ fn font_from_value(fields: &[Value]) -> FontSpec {
         font.italic = num(8) != 0;
         font.underline = num(9) != 0;
         font.strikeout = num(10) != 0;
+        // имя шрифта — единственная строка записи (после служебных чисел)
+        if let Some(name) = fields.iter().skip(3).find_map(Value::as_str) {
+            font.family = FontFamily::from_name(name);
+        }
         return font;
     }
     // виды 1-3: {7, вид, флаги, [{база}], значения по флагам...}
@@ -610,17 +727,18 @@ fn font_from_value(fields: &[Value]) -> FontSpec {
     if matches!(fields.get(vi), Some(Value::List(_))) {
         vi += 1;
     }
-    let mut take_num = |present: bool| -> Option<i64> {
+    let mut take = |present: bool| -> Option<&Value> {
         if !present {
             return None;
         }
-        let v = fields.get(vi).and_then(Value::as_num);
+        let v = fields.get(vi);
         vi += 1;
         v
     };
-    if take_num(flags & font_flags::FAMILY != 0).is_some() {
-        // имя шрифта не используется: рендер идёт встроенным шрифтом
+    if let Some(name) = take(flags & font_flags::FAMILY != 0).and_then(Value::as_str) {
+        font.family = FontFamily::from_name(name);
     }
+    let mut take_num = |present: bool| take(present).and_then(Value::as_num);
     if let Some(h) = take_num(flags & font_flags::HEIGHT != 0) {
         if h > 0 {
             font.size_tenth_pt = h as u32;
@@ -859,6 +977,47 @@ fn find_picture_table(root: &[Value], start: usize) -> Option<Vec<Vec<u8>>> {
     None
 }
 
+/// Область печати: `{тип, лево, верх, право, низ, GUID}`; тип 0 — область не
+/// задана, отрицательная граница — граница не ограничена. Возвращает `None`,
+/// если объект не той формы, и `Some(None)` для незаданной области.
+fn print_area_from_value(v: &Value) -> Option<Option<PrintArea>> {
+    let fields = v.as_list()?;
+    if fields.len() != 6 {
+        return None;
+    }
+    let guid = match &fields[5] {
+        Value::Atom(a) => a,
+        _ => return None,
+    };
+    if guid.len() != 36 || guid.matches('-').count() != 4 {
+        return None;
+    }
+    let kind = fields[0].as_num()?;
+    let mut nums = [0i64; 4];
+    for (dst, src) in nums.iter_mut().zip(&fields[1..5]) {
+        *dst = src.as_num()?;
+    }
+    if !(0..=3).contains(&kind) {
+        return None;
+    }
+    if kind == 0 {
+        return Some(None);
+    }
+    let bound = |n: i64| u32::try_from(n).ok();
+    let [l, t, r, b] = nums.map(bound);
+    if matches!((l, r), (Some(l), Some(r)) if r < l)
+        || matches!((t, b), (Some(t), Some(b)) if b < t)
+    {
+        return Some(None);
+    }
+    Some(Some(PrintArea {
+        left: l,
+        top: t,
+        right: r,
+        bottom: b,
+    }))
+}
+
 /// Объединения: объект вида `{n, {л,в,п,н,флаг} × n}`; берём записи с флагом 0.
 fn merges_from_value(v: &Value) -> Option<Vec<Merge>> {
     let fields = v.as_list()?;
@@ -1027,6 +1186,12 @@ fn parse_tail(root: &[Value], rows_end: usize, doc: &mut Document) {
             break;
         }
     }
+    // область печати: первый объект вида {тип, л, в, п, н, GUID} в хвосте
+    doc.print_area = root
+        .iter()
+        .skip(i)
+        .find_map(print_area_from_value)
+        .flatten();
     if let Some((formats, fonts, fonts_end)) = find_format_and_font_tables(root, i) {
         doc.formats = formats;
         doc.fonts = fonts;
@@ -1360,5 +1525,80 @@ mod tests {
         assert_eq!(doc.format(col1_fmt_idx).unwrap().width, Some(64));
         // объединения найдены
         assert!(!doc.merges.is_empty());
+    }
+
+    fn demo(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../mxl-demo-collection")
+            .join(name)
+    }
+
+    #[test]
+    fn font_family_by_name() {
+        for (name, family) in [
+            ("Arial", FontFamily::Sans),
+            ("Tahoma", FontFamily::Sans),
+            ("Microsoft Sans Serif", FontFamily::Sans),
+            ("Times New Roman", FontFamily::Serif),
+            ("Georgia", FontFamily::Serif),
+            ("PT Serif", FontFamily::Serif),
+            ("Courier New", FontFamily::Mono),
+            ("Consolas", FontFamily::Mono),
+            ("Lucida Console", FontFamily::Mono),
+        ] {
+            assert_eq!(FontFamily::from_name(name), family, "{name}");
+        }
+    }
+
+    #[test]
+    fn parses_print_area_page_breaks_and_font_names() {
+        let doc = parse_file(&demo("ДемонстрацияПечатиРазрывов_A4_Книжная.mxl")).unwrap();
+        // ОбластьПечати R1C1:R49C12
+        assert_eq!(
+            doc.print_area,
+            Some(PrintArea {
+                left: Some(0),
+                top: Some(0),
+                right: Some(11),
+                bottom: Some(48),
+            })
+        );
+        // разрывы после строк 25 и 36 и после колонки 12 (1-базные)
+        assert_eq!(doc.row_breaks(), vec![24, 35]);
+        assert_eq!(doc.column_breaks(), vec![11]);
+        // шрифт Consolas в таблице шрифтов — моноширинное семейство
+        assert!(doc.fonts.iter().any(|f| f.family == FontFamily::Mono));
+        assert!(doc.fonts.iter().any(|f| f.family == FontFamily::Sans));
+    }
+
+    #[test]
+    fn documents_without_print_area_or_breaks() {
+        let doc = parse_file(&demo("ДемонстрацияГраницОбъединений.mxl")).unwrap();
+        assert_eq!(doc.print_area, None);
+        assert!(doc.row_breaks().is_empty());
+        assert!(doc.column_breaks().is_empty());
+    }
+
+    #[test]
+    fn print_area_shapes() {
+        let guid = || Value::Atom("00000000-0000-0000-0000-000000000000".to_string());
+        let area = |items: [i64; 5]| {
+            let mut v: Vec<Value> = items.iter().map(|&n| Value::Num(n)).collect();
+            v.push(guid());
+            print_area_from_value(&Value::List(v))
+        };
+        assert_eq!(area([0, -1, -1, -1, -1]), Some(None));
+        assert_eq!(
+            area([1, -1, 2, -1, 5]),
+            Some(Some(PrintArea {
+                left: None,
+                top: Some(2),
+                right: None,
+                bottom: Some(5),
+            }))
+        );
+        assert_eq!(area([3, 5, 0, 2, 0]), Some(None), "перевёрнутая область");
+        assert_eq!(area([9, 0, 0, 1, 1]), None, "неизвестный тип");
+        assert_eq!(print_area_from_value(&Value::Num(3)), None);
     }
 }

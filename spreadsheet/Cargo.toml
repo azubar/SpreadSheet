@@ -1,6 +1,6 @@
 [package]
 name = "spreadsheet"
-version = "0.6.5"
+version = "0.7.0"
 edition = "2021"
 
 [lib]
@@ -15,7 +15,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 arboard = "3.4"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.52", features = ["Data_Pdf", "Storage_Streams", "Foundation", "Win32_System_Com"] }
+windows = { version = "0.62", features = ["Data_Pdf", "Storage_Streams", "Foundation", "Win32_System_Com"] }
 
 [target.'cfg(not(windows))'.dependencies]
 tempfile = "3.8"

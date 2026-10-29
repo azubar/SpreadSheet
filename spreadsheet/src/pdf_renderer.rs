@@ -3,10 +3,33 @@
 //! с выравниванием по центру.
 
 #[cfg(windows)]
-pub use win_pdf::render_pdf;
+pub use win_pdf::{page_count, render_pdf};
 
 #[cfg(not(windows))]
-pub use nix_pdf::render_pdf;
+pub use nix_pdf::{page_count, render_pdf};
+
+use std::path::Path;
+
+/// Источник PDF: файл на диске или данные в памяти (ДвоичныеДанные 1С).
+#[derive(Clone, Copy)]
+pub enum PdfInput<'a> {
+    File(&'a Path),
+    Bytes(&'a [u8]),
+}
+
+impl PdfInput<'_> {
+    /// Содержимое PDF, проверенное [`validate_pdf_bytes`].
+    fn read_validated(&self) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+        let bytes = match self {
+            PdfInput::File(path) => std::borrow::Cow::Owned(
+                std::fs::read(path).map_err(|e| format!("не удалось прочитать PDF-файл: {e}"))?,
+            ),
+            PdfInput::Bytes(bytes) => std::borrow::Cow::Borrowed(*bytes),
+        };
+        validate_pdf_bytes(&bytes)?;
+        Ok(bytes)
+    }
+}
 
 use crate::converter::{check_image_size, copy_pixmap};
 
@@ -179,69 +202,84 @@ mod tests {
 
 #[cfg(windows)]
 mod win_pdf {
-    use std::path::Path;
+    use super::PdfInput;
     use windows::Data::Pdf::{PdfDocument, PdfPageRenderOptions};
     use windows::Storage::Streams::{DataReader, DataWriter, InMemoryRandomAccessStream};
     use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
-    pub fn render_pdf(
-        path: &Path,
-        scale: u32,
-        page_number: u32,
-        base_dpi: u32,
-        spacing: u32,
-    ) -> Result<tiny_skia::Pixmap, String> {
-        let path_buf = path.to_path_buf();
+    /// Выполняет `f` в фоновом потоке COM MTA (WinRT PDF нельзя
+    /// использовать из STA-потока клиента 1С без риска блокировки).
+    fn in_mta<T: Send + 'static>(
+        f: impl FnOnce() -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
         std::thread::spawn(move || {
-            // COM MTA для фонового потока. CoUninitialize вызывается только
-            // при успешной инициализации (включая S_FALSE — «уже
-            // инициализирован»), иначе счётчик инициализаций COM потока
-            // нарушается.
+            // CoUninitialize вызывается только при успешной инициализации
+            // (включая S_FALSE — «уже инициализирован»), иначе счётчик
+            // инициализаций COM потока нарушается.
             let com_initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
-            let res = render_in_mta(&path_buf, scale, page_number, base_dpi, spacing);
+            let res = f();
             if com_initialized {
                 unsafe { CoUninitialize() };
             }
             res
         })
         .join()
-        .map_err(|_| "сбой потока рендеринга PDF".to_string())?
+        .map_err(|_| "сбой потока обработки PDF".to_string())?
     }
 
-    fn render_in_mta(
-        path: &Path,
+    pub fn render_pdf(
+        input: PdfInput,
         scale: u32,
         page_number: u32,
         base_dpi: u32,
         spacing: u32,
     ) -> Result<tiny_skia::Pixmap, String> {
-        let bytes =
-            std::fs::read(path).map_err(|e| format!("не удалось прочитать PDF-файл: {e}"))?;
-        super::validate_pdf_bytes(&bytes)?;
+        let bytes = input.read_validated()?.into_owned();
+        in_mta(move || render_in_mta(&bytes, scale, page_number, base_dpi, spacing))
+    }
 
+    /// Число страниц PDF.
+    pub fn page_count(input: PdfInput) -> Result<u32, String> {
+        let bytes = input.read_validated()?.into_owned();
+        in_mta(move || {
+            load_document(&bytes)?
+                .PageCount()
+                .map_err(|e| format!("ошибка получения числа страниц: {e}"))
+        })
+    }
+
+    fn load_document(bytes: &[u8]) -> Result<PdfDocument, String> {
         let stream = InMemoryRandomAccessStream::new()
             .map_err(|e| format!("не удалось создать поток WinRT: {e}"))?;
         let writer = DataWriter::CreateDataWriter(&stream)
             .map_err(|e| format!("не удалось создать DataWriter: {e}"))?;
         writer
-            .WriteBytes(&bytes)
+            .WriteBytes(bytes)
             .map_err(|e| format!("ошибка записи байтов в DataWriter: {e}"))?;
         writer
             .StoreAsync()
             .map_err(|e| format!("ошибка сохранения DataWriter: {e}"))?
-            .get()
+            .join()
             .map_err(|e| format!("ошибка завершения записи в поток: {e}"))?;
         writer
             .FlushAsync()
             .map_err(|e| format!("ошибка сброса DataWriter: {e}"))?
-            .get()
+            .join()
             .map_err(|e| format!("ошибка сброса потока: {e}"))?;
-        drop(bytes);
-
-        let doc = PdfDocument::LoadFromStreamAsync(&stream)
+        PdfDocument::LoadFromStreamAsync(&stream)
             .map_err(|e| format!("ошибка загрузки PDF-документа: {e}"))?
-            .get()
-            .map_err(|e| format!("ошибка открытия PDF-документа: {e}"))?;
+            .join()
+            .map_err(|e| format!("ошибка открытия PDF-документа: {e}"))
+    }
+
+    fn render_in_mta(
+        bytes: &[u8],
+        scale: u32,
+        page_number: u32,
+        base_dpi: u32,
+        spacing: u32,
+    ) -> Result<tiny_skia::Pixmap, String> {
+        let doc = load_document(bytes)?;
 
         let page_count = doc
             .PageCount()
@@ -304,7 +342,7 @@ mod win_pdf {
                 .map_err(|e| format!("не удалось создать поток для страницы: {e}"))?;
             page.RenderWithOptionsToStreamAsync(&page_stream, &render_options)
                 .map_err(|e| format!("ошибка запуска рендеринга страницы {}: {e}", p_idx + 1))?
-                .get()
+                .join()
                 .map_err(|e| format!("ошибка рендеринга страницы {}: {e}", p_idx + 1))?;
 
             let size_u64 = page_stream
@@ -315,7 +353,7 @@ mod win_pdf {
             page_reader
                 .LoadAsync(size_u64 as u32)
                 .map_err(|e| format!("ошибка чтения потока страницы: {e}"))?
-                .get()
+                .join()
                 .map_err(|e| format!("ошибка загрузки данных страницы: {e}"))?;
             let mut page_bytes = vec![0u8; size_u64 as usize];
             page_reader
@@ -333,6 +371,7 @@ mod win_pdf {
 
 #[cfg(not(windows))]
 mod nix_pdf {
+    use super::PdfInput;
     use std::path::Path;
     use std::process::{Command, ExitStatus, Stdio};
     use std::time::{Duration, Instant};
@@ -445,43 +484,76 @@ mod nix_pdf {
         Some(PdfInfo { pages, sizes })
     }
 
+    /// Временный каталог и путь к PDF для утилит poppler: файл
+    /// используется на месте, данные из памяти записываются в каталог.
+    fn prepare(input: PdfInput) -> Result<(tempfile::TempDir, std::path::PathBuf), String> {
+        let bytes = input.read_validated()?;
+        let temp_dir = tempfile::Builder::new()
+            .prefix("spreadsheet_pdf_")
+            .tempdir()
+            .map_err(|e| format!("не удалось создать временный каталог: {e}"))?;
+        let path = match input {
+            PdfInput::File(path) => path.to_path_buf(),
+            PdfInput::Bytes(_) => {
+                let path = temp_dir.path().join("input.pdf");
+                std::fs::write(&path, &bytes)
+                    .map_err(|e| format!("не удалось записать временный PDF-файл: {e}"))?;
+                path
+            }
+        };
+        Ok((temp_dir, path))
+    }
+
+    /// Сведения `pdfinfo` о документе; `None`, если утилита недоступна или
+    /// её вывод не разобран.
+    fn pdf_info(path: &Path, dir: &Path) -> Option<PdfInfo> {
+        let mut cmd = Command::new("pdfinfo");
+        cmd.arg("-box")
+            .arg("-f")
+            .arg("1")
+            .arg("-l")
+            .arg(i32::MAX.to_string())
+            .arg(path);
+        let out = run_tool(cmd, "pdfinfo", dir).ok()?;
+        out.status
+            .success()
+            .then(|| parse_pdfinfo(&out.stdout))
+            .flatten()
+    }
+
+    /// Число страниц PDF (по данным `pdfinfo`).
+    pub fn page_count(input: PdfInput) -> Result<u32, String> {
+        let (temp_dir, path) = prepare(input)?;
+        let mut cmd = Command::new("pdfinfo");
+        cmd.arg(&path);
+        let out = run_tool(cmd, "pdfinfo", temp_dir.path())?;
+        if !out.status.success() {
+            return Err(format!("ошибка выполнения pdfinfo: {}", out.stderr.trim()));
+        }
+        out.stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("Pages:"))
+            .and_then(|v| v.trim().parse().ok())
+            .ok_or_else(|| "pdfinfo не сообщил число страниц PDF".to_string())
+    }
+
     pub fn render_pdf(
-        path: &Path,
+        input: PdfInput,
         scale: u32,
         page_number: u32,
         base_dpi: u32,
         spacing: u32,
     ) -> Result<tiny_skia::Pixmap, String> {
-        let bytes =
-            std::fs::read(path).map_err(|e| format!("не удалось прочитать PDF-файл: {e}"))?;
-        super::validate_pdf_bytes(&bytes)?;
-        drop(bytes);
-
-        let temp_dir = tempfile::Builder::new()
-            .prefix("spreadsheet_pdf_")
-            .tempdir()
-            .map_err(|e| format!("не удалось создать временный каталог: {e}"))?;
+        let (temp_dir, path) = prepare(input)?;
+        let path = path.as_path();
         let dpi = super::effective_dpi(base_dpi, scale);
 
         // Предварительная проверка по pdfinfo (тот же пакет poppler-utils):
         // число страниц и итоговый размер картинки — до растеризации.
         // Если pdfinfo недоступен или его вывод не разобран, проверка
         // выполняется только по факту рендера.
-        let mut info_cmd = Command::new("pdfinfo");
-        info_cmd
-            .arg("-box")
-            .arg("-f")
-            .arg("1")
-            .arg("-l")
-            .arg(i32::MAX.to_string())
-            .arg(path);
-        if let Ok(out) = run_tool(info_cmd, "pdfinfo", temp_dir.path()) {
-            if let Some(info) = out
-                .status
-                .success()
-                .then(|| parse_pdfinfo(&out.stdout))
-                .flatten()
-            {
+        {
+            if let Some(info) = pdf_info(path, temp_dir.path()) {
                 if info.pages == 0 {
                     return Err("PDF-документ не содержит страниц".to_string());
                 }

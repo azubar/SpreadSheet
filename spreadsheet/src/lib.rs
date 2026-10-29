@@ -1,9 +1,13 @@
 //! Внешняя компонента 1С «SpreadSheet» (Native API).
 //!
-//! Конвертирует файл *.mxl (табличный документ 1С 8.х) или *.pdf в JPEG или PNG:
+//! Конвертирует табличный документ 1С 8.х (*.mxl) или *.pdf в JPEG или PNG:
 //! * `СохранитьКартинку(ПутьКФайлу, ПутьКартинки, ТипКартинки)` — в файл;
 //! * `ПолучитьКартинку(ПутьКФайлу, ТипКартинки)` — в значение ДвоичныеДанные;
-//! * `ПолучитьКартинкуВБуферОбмена(ПутьКФайлу, ТипКартинки)` — в буфер обмена.
+//! * `ПолучитьКартинкуВБуферОбмена(ПутьКФайлу, ТипКартинки)` — в буфер обмена;
+//! * те же методы с суффиксом `ИзДанных` принимают документ значением
+//!   ДвоичныеДанные вместо пути к файлу;
+//! * `КоличествоСтраниц(ПутьКФайлу)` / `КоличествоСтраницИзДанных(Данные)` —
+//!   число страниц (для выбора `НомерСтраницы`).
 //!
 //! Свойства (`Качество`, `Масштаб` и др.) применяются в момент вызова методов
 //! и проверяются до начала конвертации; `Версия` — версия компоненты.
@@ -32,6 +36,8 @@ const COMPONENT_NAME: &str = "SpreadSheet";
 /// `register_extension_as()` (макрос `#[derive(AddIn)]`) возвращает имя
 /// структуры, поэтому объект создаётся как `Новый("AddIn.<ИмяПодключения>.SpreadSheet")`.
 /// Переименование структуры сломает идентификатор `AddIn.….SpreadSheet`.
+// типы полей-методов — сигнатуры `fn(...)`, которые разбирает макрос AddIn
+#[allow(clippy::type_complexity)]
 #[derive(AddIn)]
 pub struct SpreadSheet {
     /// Соединение с платформой 1С (для передачи сообщений об ошибках)
@@ -107,6 +113,49 @@ pub struct SpreadSheet {
     #[arg(ty = Str)]
     #[returns(ty = Bool, result)]
     pub get_picture_to_clipboard: fn(&mut Self, String, String) -> Result<bool, ()>,
+
+    /// СохранитьКартинкуИзДанных(Данные, ПутьКартинки, ТипКартинки) -> Булево
+    #[add_in_func(name = "SavePictureFromData", name_ru = "СохранитьКартинкуИзДанных")]
+    #[arg(ty = Blob)]
+    #[arg(ty = Str)]
+    #[arg(ty = Str)]
+    #[returns(ty = Bool, result)]
+    pub save_picture_from_data: fn(&mut Self, Vec<u8>, String, String) -> Result<bool, ()>,
+
+    /// ПолучитьКартинкуИзДанных(Данные, ТипКартинки) -> ДвоичныеДанные
+    #[add_in_func(name = "GetPictureFromData", name_ru = "ПолучитьКартинкуИзДанных")]
+    #[arg(ty = Blob)]
+    #[arg(ty = Str)]
+    #[returns(ty = Blob, result)]
+    pub get_picture_from_data: fn(&mut Self, Vec<u8>, String) -> Result<Vec<u8>, ()>,
+
+    /// ПолучитьКартинкуИзДанныхВБуферОбмена(Данные, ТипКартинки) -> Булево
+    #[add_in_func(
+        name = "GetPictureFromDataToClipboard",
+        name_ru = "ПолучитьКартинкуИзДанныхВБуферОбмена"
+    )]
+    #[arg(ty = Blob)]
+    #[arg(ty = Str)]
+    #[returns(ty = Bool, result)]
+    pub get_picture_from_data_to_clipboard: fn(&mut Self, Vec<u8>, String) -> Result<bool, ()>,
+
+    /// КоличествоСтраниц(ПутьКФайлу) -> Число
+    #[add_in_func(name = "PageCount", name_ru = "КоличествоСтраниц")]
+    #[arg(ty = Str)]
+    #[returns(ty = Int, result)]
+    pub page_count: fn(&mut Self, String) -> Result<i32, ()>,
+
+    /// КоличествоСтраницИзДанных(Данные) -> Число
+    #[add_in_func(name = "PageCountFromData", name_ru = "КоличествоСтраницИзДанных")]
+    #[arg(ty = Blob)]
+    #[returns(ty = Int, result)]
+    pub page_count_from_data: fn(&mut Self, Vec<u8>) -> Result<i32, ()>,
+
+    /// Буфер обмена держится открытым, пока жив объект компоненты: в Linux
+    /// (X11/Wayland) содержимое буфера обмена отдаёт сам процесс-владелец, и
+    /// при закрытии объекта `arboard::Clipboard` сразу после вызова картинка
+    /// могла пропасть до вставки.
+    clipboard: Option<arboard::Clipboard>,
 }
 
 impl Default for SpreadSheet {
@@ -127,8 +176,33 @@ impl Default for SpreadSheet {
             save_picture: Self::save_picture_inner,
             get_picture: Self::get_picture_inner,
             get_picture_to_clipboard: Self::get_picture_to_clipboard_inner,
+            save_picture_from_data: Self::save_picture_from_data_inner,
+            get_picture_from_data: Self::get_picture_from_data_inner,
+            get_picture_from_data_to_clipboard: Self::get_picture_from_data_to_clipboard_inner,
+            page_count: Self::page_count_inner,
+            page_count_from_data: Self::page_count_from_data_inner,
+            clipboard: None,
         }
     }
+}
+
+/// Источник документа: путь к файлу или данные в памяти.
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    File(&'a str),
+    Data(&'a [u8]),
+}
+
+impl<'a> From<&'a str> for Source<'a> {
+    fn from(path: &'a str) -> Self {
+        Source::File(path)
+    }
+}
+
+/// Загруженный документ: PDF (рендерится средствами ОС) или разобранный MXL.
+enum Loaded<'a> {
+    Pdf(pdf_renderer::PdfInput<'a>),
+    Mxl(Box<mxl_parser::Document>),
 }
 
 /// Проверенные значения общих свойств.
@@ -154,24 +228,11 @@ impl SpreadSheet {
         image_path: String,
         image_type: String,
     ) -> Result<bool, ()> {
-        let result = guarded(|| {
-            let (pixmap, settings) = self.prepare_pixmap(&path, &image_type)?;
-            converter::encode_to_file(
-                &pixmap,
-                Path::new(&image_path),
-                &settings.kind,
-                settings.max_bytes,
-            )
-        });
-        self.finish(result.map(|()| true), false)
+        self.save_picture_from(Source::File(&path), &image_path, &image_type)
     }
 
     fn get_picture_inner(&mut self, path: String, image_type: String) -> Result<Vec<u8>, ()> {
-        let result = guarded(|| {
-            let (pixmap, settings) = self.prepare_pixmap(&path, &image_type)?;
-            converter::encode_to_vec(&pixmap, &settings.kind, settings.max_bytes)
-        });
-        self.finish(result, Vec::new())
+        self.get_picture_from(Source::File(&path), &image_type)
     }
 
     fn get_picture_to_clipboard_inner(
@@ -179,24 +240,108 @@ impl SpreadSheet {
         path: String,
         image_type: String,
     ) -> Result<bool, ()> {
+        self.get_picture_to_clipboard_from(Source::File(&path), &image_type)
+    }
+
+    fn save_picture_from_data_inner(
+        &mut self,
+        data: Vec<u8>,
+        image_path: String,
+        image_type: String,
+    ) -> Result<bool, ()> {
+        self.save_picture_from(Source::Data(&data), &image_path, &image_type)
+    }
+
+    fn get_picture_from_data_inner(
+        &mut self,
+        data: Vec<u8>,
+        image_type: String,
+    ) -> Result<Vec<u8>, ()> {
+        self.get_picture_from(Source::Data(&data), &image_type)
+    }
+
+    fn get_picture_from_data_to_clipboard_inner(
+        &mut self,
+        data: Vec<u8>,
+        image_type: String,
+    ) -> Result<bool, ()> {
+        self.get_picture_to_clipboard_from(Source::Data(&data), &image_type)
+    }
+
+    fn page_count_inner(&mut self, path: String) -> Result<i32, ()> {
+        let result = guarded(|| self.count_pages(Source::File(&path)));
+        self.finish(result, 0)
+    }
+
+    fn page_count_from_data_inner(&mut self, data: Vec<u8>) -> Result<i32, ()> {
+        let result = guarded(|| self.count_pages(Source::Data(&data)));
+        self.finish(result, 0)
+    }
+
+    fn save_picture_from(
+        &mut self,
+        source: Source,
+        image_path: &str,
+        image_type: &str,
+    ) -> Result<bool, ()> {
         let result = guarded(|| {
-            let (pixmap, _settings) = self.prepare_pixmap(&path, &image_type)?;
-            // Все этапы рендера дают непрозрачные пиксели (альфа 255), а для
-            // таких пикселей премультиплицированный RGBA tiny-skia совпадает
-            // с обычным RGBA, который ожидает arboard, — буфер передаётся
-            // без копирования.
-            let img_data = arboard::ImageData {
-                width: pixmap.width() as usize,
-                height: pixmap.height() as usize,
-                bytes: std::borrow::Cow::Borrowed(pixmap.data()),
-            };
-            let mut clipboard = arboard::Clipboard::new()
-                .map_err(|e| format!("нет доступа к буферу обмена: {e}"))?;
-            clipboard
-                .set_image(img_data)
-                .map_err(|e| format!("не удалось поместить картинку в буфер обмена: {e}"))
+            let (pixmap, settings) = self.prepare_pixmap(source, image_type)?;
+            converter::encode_to_file(
+                &pixmap,
+                Path::new(image_path),
+                &settings.kind,
+                settings.max_bytes,
+            )
         });
         self.finish(result.map(|()| true), false)
+    }
+
+    fn get_picture_from(&mut self, source: Source, image_type: &str) -> Result<Vec<u8>, ()> {
+        let result = guarded(|| {
+            let (pixmap, settings) = self.prepare_pixmap(source, image_type)?;
+            converter::encode_to_vec(&pixmap, &settings.kind, settings.max_bytes)
+        });
+        self.finish(result, Vec::new())
+    }
+
+    fn get_picture_to_clipboard_from(
+        &mut self,
+        source: Source,
+        image_type: &str,
+    ) -> Result<bool, ()> {
+        let result = guarded(|| {
+            let (pixmap, _settings) = self.prepare_pixmap(source, image_type)?;
+            self.set_clipboard_image(&pixmap)
+        });
+        self.finish(result.map(|()| true), false)
+    }
+
+    fn set_clipboard_image(&mut self, pixmap: &tiny_skia::Pixmap) -> Result<(), String> {
+        // Все этапы рендера дают непрозрачные пиксели (альфа 255), а для
+        // таких пикселей премультиплицированный RGBA tiny-skia совпадает
+        // с обычным RGBA, который ожидает arboard, — буфер передаётся
+        // без копирования.
+        let img_data = arboard::ImageData {
+            width: pixmap.width() as usize,
+            height: pixmap.height() as usize,
+            bytes: std::borrow::Cow::Borrowed(pixmap.data()),
+        };
+        let clipboard = match &mut self.clipboard {
+            Some(clipboard) => clipboard,
+            empty => empty.insert(
+                arboard::Clipboard::new()
+                    .map_err(|e| format!("нет доступа к буферу обмена: {e}"))?,
+            ),
+        };
+        let result = clipboard
+            .set_image(img_data)
+            .map_err(|e| format!("не удалось поместить картинку в буфер обмена: {e}"));
+        if result.is_err() {
+            // соединение с буфером обмена могло устареть — при следующем
+            // вызове оно будет открыто заново
+            self.clipboard = None;
+        }
+        result
     }
 
     /// Завершает вызов метода: запоминает текст ошибки в `ОписаниеОшибки` и
@@ -279,14 +424,19 @@ impl SpreadSheet {
         })
     }
 
-    /// Проверяет свойства, относящиеся только к PDF.
-    fn pdf_settings(&self) -> Result<(u32, u32, u32), String> {
-        if self.page_number < 0 {
-            return Err(format!(
+    /// Проверяет `НомерСтраницы` (для MXL и PDF).
+    fn page_number(&self) -> Result<u32, String> {
+        u32::try_from(self.page_number).map_err(|_| {
+            format!(
                 "недопустимый НомерСтраницы {}: ожидается 0 или больше",
                 self.page_number
-            ));
-        }
+            )
+        })
+    }
+
+    /// Проверяет свойства, относящиеся только к PDF.
+    fn pdf_settings(&self) -> Result<(u32, u32, u32), String> {
+        let page_number = self.page_number()?;
         if !(50..=600).contains(&self.pdf_dpi) {
             return Err(format!(
                 "недопустимое РазрешениеPDF {}: ожидается от 50 до 600 DPI",
@@ -300,34 +450,76 @@ impl SpreadSheet {
             ));
         }
         Ok((
-            self.page_number as u32,
+            page_number,
             self.pdf_dpi as u32,
             self.pdf_page_spacing as u32,
         ))
     }
 
-    /// Общая часть методов: проверка свойств и типа, разбор и рендер файла.
-    fn prepare_pixmap(
+    /// Определяет тип документа и разбирает MXL.
+    fn load<'a>(&self, source: Source<'a>) -> Result<Loaded<'a>, String> {
+        match source {
+            Source::File(path_str) => {
+                let path = Path::new(path_str);
+                if !path.is_file() {
+                    return Err(format!("файл не найден: {path_str}"));
+                }
+                if detect_pdf(path)? {
+                    Ok(Loaded::Pdf(pdf_renderer::PdfInput::File(path)))
+                } else {
+                    let doc = mxl_parser::parse_file(path).map_err(|e| e.to_string())?;
+                    Ok(Loaded::Mxl(Box::new(doc)))
+                }
+            }
+            Source::Data(data) => {
+                if data.is_empty() {
+                    return Err("переданы пустые ДвоичныеДанные".to_string());
+                }
+                if has_pdf_signature(data) {
+                    Ok(Loaded::Pdf(pdf_renderer::PdfInput::Bytes(data)))
+                } else {
+                    if data.len() as u64 > mxl_parser::MAX_FILE_SIZE {
+                        return Err(format!(
+                            "слишком большой документ ({} МБ, предел {} МБ)",
+                            data.len() / 1024 / 1024,
+                            mxl_parser::MAX_FILE_SIZE / 1024 / 1024
+                        ));
+                    }
+                    let doc = mxl_parser::parse_bytes(data).map_err(|e| e.to_string())?;
+                    Ok(Loaded::Mxl(Box::new(doc)))
+                }
+            }
+        }
+    }
+
+    /// Общая часть методов: проверка свойств и типа, разбор и рендер.
+    fn prepare_pixmap<'a>(
         &self,
-        path_str: &str,
+        source: impl Into<Source<'a>>,
         image_type: &str,
     ) -> Result<(tiny_skia::Pixmap, Settings), String> {
         let settings = self.settings(image_type)?;
-        let source = Path::new(path_str);
-        if !source.is_file() {
-            return Err(format!("файл не найден: {path_str}"));
-        }
-
-        let pixmap = if detect_pdf(source)? {
-            let (page_number, dpi, spacing) = self.pdf_settings()?;
-            pdf_renderer::render_pdf(source, settings.scale, page_number, dpi, spacing)?
-        } else {
-            let doc = mxl_parser::parse_file(source).map_err(|e| e.to_string())?;
-            converter::render(&doc, settings.scale)?
+        let pixmap = match self.load(source.into())? {
+            Loaded::Pdf(input) => {
+                let (page_number, dpi, spacing) = self.pdf_settings()?;
+                pdf_renderer::render_pdf(input, settings.scale, page_number, dpi, spacing)?
+            }
+            Loaded::Mxl(doc) => match self.page_number()? {
+                0 => converter::render(&doc, settings.scale)?,
+                page => converter::render_page(&doc, settings.scale, page)?,
+            },
         };
-
         let pixmap = apply_margins(pixmap, settings.margins)?;
         Ok((pixmap, settings))
+    }
+
+    /// Число страниц документа (MXL — по области печати и разрывам).
+    fn count_pages(&self, source: Source) -> Result<i32, String> {
+        let count = match self.load(source)? {
+            Loaded::Pdf(input) => pdf_renderer::page_count(input)? as usize,
+            Loaded::Mxl(doc) => converter::pages(&doc).len(),
+        };
+        Ok(count.min(i32::MAX as usize) as i32)
     }
 
     fn report_error(&self, message: &str) {
@@ -369,10 +561,15 @@ fn detect_pdf(path: &Path) -> Result<bool, String> {
     let n = file
         .read(&mut buffer)
         .map_err(|e| format!("ошибка чтения файла: {e}"))?;
-    let pdf_sig = b"%PDF-";
-    Ok(buffer[..n]
-        .windows(pdf_sig.len())
-        .any(|window| window == pdf_sig))
+    Ok(has_pdf_signature(&buffer[..n]))
+}
+
+/// Признак PDF: сигнатура `%PDF-` в первом килобайте (допускается мусор
+/// перед заголовком, как и в программах просмотра PDF).
+fn has_pdf_signature(data: &[u8]) -> bool {
+    data[..data.len().min(1024)]
+        .windows(5)
+        .any(|window| window == b"%PDF-")
 }
 
 extern_functions! {
@@ -615,5 +812,156 @@ mod tests {
             sizes[2] <= sizes[0],
             "максимальное сжатие крупнее быстрого: {sizes:?}"
         );
+    }
+
+    fn printing_demo_path() -> String {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../mxl-demo-collection/ДемонстрацияПечатиРазрывов_A4_Книжная.mxl")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Минимальный корректный PDF из пустых страниц заданных размеров (pt).
+    fn minimal_pdf(pages: &[(u32, u32)]) -> Vec<u8> {
+        let mut objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            format!(
+                "<< /Type /Pages /Kids [{}] /Count {} >>",
+                (0..pages.len())
+                    .map(|i| format!("{} 0 R", i + 3))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                pages.len()
+            ),
+        ];
+        for (w, h) in pages {
+            objects.push(format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w} {h}] >>"
+            ));
+        }
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, o) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref = out.len();
+        out.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+        );
+        for o in offsets {
+            out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    /// PDF-тесты на Linux требуют poppler-utils; без них тест пропускается.
+    fn pdf_tools_available() -> bool {
+        if cfg!(windows) {
+            return true;
+        }
+        let ok = std::process::Command::new("pdftoppm")
+            .arg("-v")
+            .output()
+            .is_ok();
+        if !ok {
+            eprintln!("pdftoppm не найден — PDF-тест пропущен");
+        }
+        ok
+    }
+
+    #[test]
+    fn picture_from_data_matches_picture_from_file() {
+        let path = demo_mxl();
+        let data = std::fs::read(&path).unwrap();
+        let mut addin = SpreadSheet::default();
+        let from_file = (addin.get_picture)(&mut addin, path, "PNG".into()).unwrap();
+        let from_data =
+            (addin.get_picture_from_data)(&mut addin, data.clone(), "PNG".into()).unwrap();
+        assert_eq!(from_file, from_data);
+
+        let out = TempFile::new("from_data.jpg", b"");
+        assert_eq!(
+            (addin.save_picture_from_data)(&mut addin, data, out.path().into(), "JPEG".into()),
+            Ok(true)
+        );
+        assert!(std::fs::read(&out.0).unwrap().starts_with(&[0xFF, 0xD8]));
+    }
+
+    #[test]
+    fn bad_data_is_reported() {
+        let mut addin = SpreadSheet {
+            throw_errors: false,
+            ..Default::default()
+        };
+        let r = (addin.get_picture_from_data)(&mut addin, Vec::new(), "PNG".into());
+        assert_eq!(r, Ok(Vec::new()));
+        assert!(addin.last_error.contains("пустые"), "{}", addin.last_error);
+        let r = (addin.get_picture_from_data)(&mut addin, b"garbage".to_vec(), "PNG".into());
+        assert_eq!(r, Ok(Vec::new()));
+        assert!(addin.last_error.contains("MOXCEL"), "{}", addin.last_error);
+        assert_eq!((addin.page_count_from_data)(&mut addin, Vec::new()), Ok(0));
+    }
+
+    #[test]
+    fn mxl_page_count_and_page_selection() {
+        let path = printing_demo_path();
+        let mut addin = SpreadSheet::default();
+        assert_eq!((addin.page_count)(&mut addin, path.clone()), Ok(3));
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!((addin.page_count_from_data)(&mut addin, data), Ok(3));
+
+        let size = |addin: &mut SpreadSheet| {
+            let bytes = (addin.get_picture)(addin, path.clone(), "PNG".into()).unwrap();
+            let img = image::load_from_memory(&bytes).unwrap();
+            (img.width(), img.height())
+        };
+        let (full_w, full_h) = size(&mut addin);
+        addin.page_number = 2;
+        let (w, h) = size(&mut addin);
+        assert_eq!(w, full_w);
+        assert!(h < full_h / 2, "{h} vs {full_h}");
+
+        addin.page_number = 4;
+        addin.throw_errors = false;
+        let r = (addin.get_picture)(&mut addin, path, "PNG".into());
+        assert_eq!(r, Ok(Vec::new()));
+        assert!(
+            addin.last_error.contains("всего 3 стр."),
+            "{}",
+            addin.last_error
+        );
+    }
+
+    #[test]
+    fn pdf_from_data_and_page_count() {
+        if !pdf_tools_available() {
+            return;
+        }
+        let pdf = minimal_pdf(&[(595, 842), (842, 595), (300, 300)]);
+        let mut addin = SpreadSheet::default();
+        assert_eq!((addin.page_count_from_data)(&mut addin, pdf.clone()), Ok(3));
+        let file = TempFile::new("pages.pdf", &pdf);
+        assert_eq!((addin.page_count)(&mut addin, file.path().into()), Ok(3));
+
+        addin.page_number = 2;
+        let bytes = (addin.get_picture_from_data)(&mut addin, pdf.clone(), "PNG".into()).unwrap();
+        let img = image::load_from_memory(&bytes).unwrap();
+        // 842 x 595 pt при 96 DPI ≈ 1123 x 794 px (альбомная страница)
+        assert!(
+            img.width() > img.height(),
+            "{}x{}",
+            img.width(),
+            img.height()
+        );
+        let from_file = (addin.get_picture)(&mut addin, file.path().into(), "PNG".into()).unwrap();
+        assert_eq!(bytes, from_file);
     }
 }
