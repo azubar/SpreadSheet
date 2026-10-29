@@ -472,6 +472,9 @@ fn parse_rows(root: &[Value], start: usize) -> Result<(Vec<Row>, usize), MxlErro
         if index <= prev || index < 0 {
             return err("MXL8: номера строк не возрастают — файл повреждён");
         }
+        if index > u32::MAX as i64 {
+            return err(format!("MXL8: недопустимый номер строки {index}"));
+        }
         if !(0..=100_000).contains(&ncells) {
             return err(format!("MXL8: неправдоподобное число ячеек {ncells}"));
         }
@@ -484,8 +487,8 @@ fn parse_rows(root: &[Value], start: usize) -> Result<(Vec<Row>, usize), MxlErro
                 .get(i + 1)
                 .and_then(Value::as_list)
                 .ok_or_else(|| MxlError("MXL8: ожидался объект ячейки".to_string()))?;
-            if col < 0 {
-                return err("MXL8: отрицательный номер колонки");
+            if !(0..=u32::MAX as i64).contains(&col) {
+                return err(format!("MXL8: недопустимый номер колонки {col}"));
             }
             let cell = cell_from_value(cell_fields).unwrap_or(Cell {
                 format: 0,
@@ -518,7 +521,7 @@ fn column_group_from_value(v: &Value) -> Option<ColumnGroup> {
     for k in 0..n as usize {
         let col = fields[4 + 2 * k].as_num()?;
         let fmt = fields[5 + 2 * k].as_num()?;
-        if col < 0 || fmt < 0 {
+        if !(0..=u32::MAX as i64).contains(&col) || !(0..=u32::MAX as i64).contains(&fmt) {
             return None;
         }
         columns.push((col as u32, fmt as u32));
@@ -874,7 +877,15 @@ fn merges_from_value(v: &Value) -> Option<Vec<Merge>> {
             *dst = src.as_num()?;
         }
         let [l, t, r, b, flag] = nums;
-        if flag != 0 || l < 0 || t < 0 || r < l || b < t {
+        // r и b не меньше l и t, поэтому достаточно проверить их предел
+        if flag != 0
+            || l < 0
+            || t < 0
+            || r < l
+            || b < t
+            || r > u32::MAX as i64
+            || b > u32::MAX as i64
+        {
             continue;
         }
         merges.push(Merge {

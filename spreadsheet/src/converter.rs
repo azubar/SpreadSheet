@@ -6,11 +6,13 @@
 //! рендера — 96 DPI, т.е. 1 единица ширины = 7/8 px, 1 единица высоты = 1/3 px;
 //! свойство «Масштаб» умножает обе величины.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io::BufWriter;
+use std::io::Write;
 use std::path::Path;
+use std::rc::Rc;
 
-use ab_glyph::{Font, FontRef, ScaleFont};
+use ab_glyph::{Font, FontRef, GlyphId, PxScaleFont, ScaleFont};
 use tiny_skia::{Paint, Pixmap, Rect, Transform};
 
 use crate::mxl_parser::{Cell, CellFormat, Document, DrawingKind, FontSpec, LineSpec, Merge};
@@ -35,15 +37,67 @@ const CELL_PAD_Y: f32 = 3.0;
 /// Предел размеров картинки по каждой стороне. 65 500 — предел большинства
 /// кодеков (в частности, JPEG не поддерживает сторону > 65 535). Длинные
 /// документы (например, прайс на тысячу строк) при этом отрисовываются.
-const MAX_DIMENSION: u32 = 65_500;
+pub const MAX_DIMENSION: u32 = 65_500;
+/// Предел площади картинки в пикселях. Буфер RGBA занимает 4 байта на
+/// пиксель, ещё 3 байта на пиксель нужны при кодировании, — 250 Мпикс это
+/// около 1,75 ГБ. Без этого предела картинка 65 500 × 65 500 потребовала бы
+/// ~30 ГБ, и нехватка памяти аварийно завершила бы процесс 1С целиком
+/// (`catch_unwind` такую ошибку не перехватывает).
+pub const MAX_PIXELS: u64 = 250_000_000;
+/// Предел размера закодированной картинки по умолчанию (свойство
+/// «МаксимальныйРазмерКартинки»), байт.
+pub const DEFAULT_MAX_IMAGE_BYTES: usize = 50_000_000;
+/// Предел числа записей индекса объединений (см. [`MergeIndex`]): защита от
+/// документов с множеством огромных (в т.ч. перекрывающихся) объединений.
+const MAX_MERGE_INDEX_ENTRIES: usize = 10_000_000;
+
+/// Проверяет, что картинку заданного размера можно создать: каждая сторона
+/// не больше [`MAX_DIMENSION`], площадь не больше [`MAX_PIXELS`]. Вызывается
+/// до выделения памяти под буфер. `hint` — подсказка, что уменьшить.
+pub fn check_image_size(width: u64, height: u64, hint: &str) -> Result<(), String> {
+    if width > MAX_DIMENSION as u64 || height > MAX_DIMENSION as u64 {
+        return Err(format!(
+            "слишком большая картинка {width}x{height}px \
+             (предел стороны {MAX_DIMENSION}px) — {hint}"
+        ));
+    }
+    if width * height > MAX_PIXELS {
+        return Err(format!(
+            "слишком большая картинка {width}x{height}px ({} Мпикс, \
+             предел {} Мпикс) — {hint}",
+            width * height / 1_000_000,
+            MAX_PIXELS / 1_000_000
+        ));
+    }
+    Ok(())
+}
+
+/// Степень сжатия PNG (свойство «СжатиеPNG»).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PngCompression {
+    /// Быстрое кодирование, файл крупнее
+    Fast,
+    /// Баланс скорости и размера
+    Default,
+    /// Наименьший файл, кодирование медленнее
+    Best,
+}
 
 #[derive(Debug, Clone)]
 pub enum ImageKind {
     Jpeg { quality: u8 },
-    Png,
+    Png { compression: PngCompression },
 }
 
-/// Полный конвейер: модель → картинка на диске.
+impl ImageKind {
+    /// PNG со сжатием по умолчанию.
+    pub const PNG: ImageKind = ImageKind::Png {
+        compression: PngCompression::Default,
+    };
+}
+
+/// Полный конвейер: модель → картинка на диске (предел размера файла —
+/// [`DEFAULT_MAX_IMAGE_BYTES`]).
 pub fn convert(
     doc: &Document,
     out_path: &Path,
@@ -51,7 +105,7 @@ pub fn convert(
     scale_percent: u32,
 ) -> Result<(), String> {
     let pixmap = render(doc, scale_percent)?;
-    encode(&pixmap, out_path, kind)
+    encode_to_file(&pixmap, out_path, kind, DEFAULT_MAX_IMAGE_BYTES)
 }
 
 // ---------------------------------------------------------------------------
@@ -92,31 +146,135 @@ impl Layout {
     }
 }
 
+/// Растр глифа, готовый к наложению: покрытие пикселей прямоугольника
+/// `w × h`, левый верхний угол которого смещён на `(min_x, min_y)` px от
+/// целой части позиции глифа.
+struct GlyphBitmap {
+    min_x: f32,
+    min_y: f32,
+    w: usize,
+    coverage: Vec<f32>,
+}
+
+/// Ключ кэша растров: начертание, глиф, размер и дробная часть позиции
+/// (растр зависит только от них — см. `ab_glyph::OutlinedGlyph::px_bounds`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct GlyphKey {
+    face: u8,
+    glyph: u16,
+    scale_x: u32,
+    scale_y: u32,
+    fract_x: u32,
+    fract_y: u32,
+}
+
+/// Предел числа растров в кэше (каждый — от сотен байт до десятков КБ).
+const GLYPH_CACHE_LIMIT: usize = 20_000;
+
 struct Fonts<'a> {
-    regular: FontRef<'a>,
-    bold: FontRef<'a>,
-    italic: FontRef<'a>,
-    bold_italic: FontRef<'a>,
+    /// regular, bold, italic, bold italic
+    faces: [FontRef<'a>; 4],
+    /// Кэш растров глифов: документ набран несколькими шрифтами и
+    /// размерами, поэтому одни и те же глифы растеризуются многократно.
+    glyphs: RefCell<HashMap<GlyphKey, Option<Rc<GlyphBitmap>>>>,
 }
 
 impl<'a> Fonts<'a> {
     fn load() -> Result<Fonts<'a>, String> {
         let load = |data| FontRef::try_from_slice(data).map_err(|e| format!("шрифт: {e}"));
         Ok(Fonts {
-            regular: load(FONT_REGULAR)?,
-            bold: load(FONT_BOLD)?,
-            italic: load(FONT_ITALIC)?,
-            bold_italic: load(FONT_BOLD_ITALIC)?,
+            faces: [
+                load(FONT_REGULAR)?,
+                load(FONT_BOLD)?,
+                load(FONT_ITALIC)?,
+                load(FONT_BOLD_ITALIC)?,
+            ],
+            glyphs: RefCell::new(HashMap::new()),
         })
     }
 
-    fn pick(&self, spec: &FontSpec) -> &FontRef<'a> {
+    fn face_index(spec: &FontSpec) -> usize {
         match (spec.bold, spec.italic) {
-            (false, false) => &self.regular,
-            (true, false) => &self.bold,
-            (false, true) => &self.italic,
-            (true, true) => &self.bold_italic,
+            (false, false) => 0,
+            (true, false) => 1,
+            (false, true) => 2,
+            (true, true) => 3,
         }
+    }
+
+    fn pick(&self, spec: &FontSpec) -> &FontRef<'a> {
+        &self.faces[Self::face_index(spec)]
+    }
+
+    /// Шрифт нужного начертания в масштабе `px`.
+    fn scaled(&self, spec: &FontSpec, px: f32) -> ScaledFace<'_, 'a> {
+        ScaledFace {
+            face: Self::face_index(spec) as u8,
+            font: self.pick(spec).as_scaled(px),
+        }
+    }
+
+    /// Растр глифа `id` в позиции `(x, y)`. Возвращает растр и целую часть
+    /// позиции, к которой прибавляется смещение растра.
+    fn glyph_bitmap(
+        &self,
+        sf: &ScaledFace,
+        id: GlyphId,
+        x: f32,
+        y: f32,
+    ) -> (Option<Rc<GlyphBitmap>>, f32, f32) {
+        let (trunc_x, fract_x) = (x.trunc(), x.fract());
+        let (trunc_y, fract_y) = (y.trunc(), y.fract());
+        let scale = sf.font.scale();
+        let key = GlyphKey {
+            face: sf.face,
+            glyph: id.0,
+            scale_x: scale.x.to_bits(),
+            scale_y: scale.y.to_bits(),
+            fract_x: fract_x.to_bits(),
+            fract_y: fract_y.to_bits(),
+        };
+        if let Some(cached) = self.glyphs.borrow().get(&key) {
+            return (cached.clone(), trunc_x, trunc_y);
+        }
+        // Растеризация в позиции, равной дробной части: результат совпадает
+        // с растеризацией в исходной позиции со сдвигом на целую часть.
+        let glyph = id.with_scale_and_position(scale, ab_glyph::point(fract_x, fract_y));
+        let bitmap = sf.font.font().outline_glyph(glyph).map(|outlined| {
+            let bounds = outlined.px_bounds();
+            let w = bounds.width() as usize;
+            let h = bounds.height() as usize;
+            let mut coverage = vec![0.0f32; w * h];
+            outlined.draw(|gx, gy, cov| {
+                coverage[gy as usize * w + gx as usize] = cov;
+            });
+            Rc::new(GlyphBitmap {
+                min_x: bounds.min.x,
+                min_y: bounds.min.y,
+                w,
+                coverage,
+            })
+        });
+        let mut cache = self.glyphs.borrow_mut();
+        if cache.len() >= GLYPH_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(key, bitmap.clone());
+        (bitmap, trunc_x, trunc_y)
+    }
+}
+
+/// Шрифт конкретного начертания в конкретном масштабе.
+struct ScaledFace<'f, 'a> {
+    face: u8,
+    font: PxScaleFont<&'f FontRef<'a>>,
+}
+
+impl<'f, 'a> std::ops::Deref for ScaledFace<'f, 'a> {
+    type Target = PxScaleFont<&'f FontRef<'a>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.font
     }
 }
 
@@ -131,10 +289,13 @@ fn line_height(fonts: &Fonts, spec: &FontSpec, scale: f32) -> f32 {
     f.ascent() - f.descent()
 }
 
-fn text_width(fonts: &Fonts, spec: &FontSpec, scale: f32, text: &str) -> f32 {
-    let f = fonts.pick(spec).as_scaled(font_px(spec, scale));
-    let mut w = 0.0;
-    let mut prev = None;
+/// Состояние измерения строки: ширина и последний глиф (для кернинга).
+type Measure = (f32, Option<GlyphId>);
+
+/// Продолжает измерение ширины строки с состояния `state` на `text`.
+/// Измерение строки целиком и по частям даёт одинаковый результат.
+fn measure_more<SF: ScaleFont<F>, F: Font>(f: &SF, state: Measure, text: &str) -> Measure {
+    let (mut w, mut prev) = state;
     for ch in text.chars() {
         // управляющие символы (табуляция, возврат каретки и пр.) не имеют
         // глифа — иначе они рисуются «квадратом .notdef»
@@ -149,30 +310,42 @@ fn text_width(fonts: &Fonts, spec: &FontSpec, scale: f32, text: &str) -> f32 {
         w += f.h_advance(id);
         prev = Some(id);
     }
-    w
+    (w, prev)
 }
 
-/// Перенос текста по словам под заданную ширину.
+fn text_width(fonts: &Fonts, spec: &FontSpec, scale: f32, text: &str) -> f32 {
+    let f = fonts.pick(spec).as_scaled(font_px(spec, scale));
+    measure_more(&f, (0.0, None), text).0
+}
+
+/// Перенос текста по словам под заданную ширину. Ширина строки-кандидата
+/// наращивается по словам, а не пересчитывается целиком (линейное время).
 fn wrap_text(fonts: &Fonts, spec: &FontSpec, scale: f32, text: &str, max_w: f32) -> Vec<String> {
+    let f = fonts.pick(spec).as_scaled(font_px(spec, scale));
     let mut lines = Vec::new();
     for raw_line in text.split('\n') {
         let raw_line = raw_line.trim_end_matches('\r');
-        if text_width(fonts, spec, scale, raw_line) <= max_w {
+        if measure_more(&f, (0.0, None), raw_line).0 <= max_w {
             lines.push(raw_line.to_string());
             continue;
         }
         let mut current = String::new();
+        let mut current_m: Measure = (0.0, None);
         for word in raw_line.split(' ') {
-            let candidate = if current.is_empty() {
-                word.to_string()
-            } else {
-                format!("{current} {word}")
-            };
-            if text_width(fonts, spec, scale, &candidate) <= max_w || current.is_empty() {
-                current = candidate;
+            if current.is_empty() {
+                current.push_str(word);
+                current_m = measure_more(&f, (0.0, None), word);
+                continue;
+            }
+            let candidate_m = measure_more(&f, measure_more(&f, current_m, " "), word);
+            if candidate_m.0 <= max_w {
+                current.push(' ');
+                current.push_str(word);
+                current_m = candidate_m;
             } else {
                 lines.push(std::mem::take(&mut current));
-                current = word.to_string();
+                current.push_str(word);
+                current_m = measure_more(&f, (0.0, None), word);
             }
         }
         if !current.is_empty() {
@@ -183,6 +356,93 @@ fn wrap_text(fonts: &Fonts, spec: &FontSpec, scale: f32, text: &str, max_w: f32)
         lines.push(String::new());
     }
     lines
+}
+
+/// Индекс объединений: для каждой строки документа — отрезки колонок
+/// `(левая, правая, индекс объединения)`, упорядоченные по левой колонке.
+///
+/// Хранятся только строки, в которых есть ячейки (запросы бывают только к
+/// ним), поэтому размер индекса не зависит от площади объединений: прежняя
+/// карта «ячейка → объединение» для объединения 100 000 × 100 000 из
+/// повреждённого файла заняла бы 10¹⁰ записей.
+struct MergeIndex {
+    rows: HashMap<u32, Vec<(u32, u32, usize)>>,
+}
+
+impl MergeIndex {
+    fn new(doc: &Document) -> Result<MergeIndex, String> {
+        let mut row_indices: Vec<u32> = doc.rows.iter().map(|r| r.index).collect();
+        row_indices.sort_unstable();
+        row_indices.dedup();
+        let span = |m: &Merge| {
+            let a = row_indices.partition_point(|&r| r < m.top);
+            let b = row_indices.partition_point(|&r| r <= m.bottom);
+            &row_indices[a..b]
+        };
+        let entries: usize = doc.merges.iter().map(|m| span(m).len()).sum();
+        if entries > MAX_MERGE_INDEX_ENTRIES {
+            return Err(format!(
+                "слишком сложная структура объединений ячеек ({entries} записей, \
+                 предел {MAX_MERGE_INDEX_ENTRIES}) — файл, вероятно, повреждён"
+            ));
+        }
+        let mut rows: HashMap<u32, Vec<(u32, u32, usize)>> = HashMap::new();
+        for (i, m) in doc.merges.iter().enumerate() {
+            for &r in span(m) {
+                rows.entry(r).or_default().push((m.left, m.right, i));
+            }
+        }
+        for spans in rows.values_mut() {
+            spans.sort_unstable();
+        }
+        Ok(MergeIndex { rows })
+    }
+
+    /// Индекс объединения, покрывающего ячейку (строка, колонка).
+    fn get(&self, &(row, col): &(u32, u32)) -> Option<&usize> {
+        let spans = self.rows.get(&row)?;
+        let k = spans.partition_point(|&(left, _, _)| left <= col);
+        let (_, right, i) = spans.get(k.checked_sub(1)?)?;
+        (col <= *right).then_some(i)
+    }
+
+    fn contains_key(&self, cell: &(u32, u32)) -> bool {
+        self.get(cell).is_some()
+    }
+}
+
+/// Данные документа, которые нужны на всех этапах рендера и вычисляются
+/// один раз: индекс объединений и эффективные форматы ячеек.
+struct Prepared {
+    merges: MergeIndex,
+    /// (формат строки, формат ячейки) → эффективный формат
+    formats: HashMap<(u32, u32), CellFormat>,
+    no_format: CellFormat,
+}
+
+impl Prepared {
+    fn new(doc: &Document) -> Result<Prepared, String> {
+        let mut formats = HashMap::new();
+        for row in &doc.rows {
+            for (_, cell) in &row.cells {
+                formats
+                    .entry((row.format, cell.format))
+                    .or_insert_with(|| effective_format(doc, row.format, cell));
+            }
+        }
+        Ok(Prepared {
+            merges: MergeIndex::new(doc)?,
+            formats,
+            no_format: CellFormat::default(),
+        })
+    }
+
+    /// Эффективный формат ячейки строки (см. [`effective_format`]).
+    fn format(&self, row_format: u32, cell: &Cell) -> &CellFormat {
+        self.formats
+            .get(&(row_format, cell.format))
+            .unwrap_or(&self.no_format)
+    }
 }
 
 /// Эффективный формат ячейки: собственный формат ячейки поверх формата строки
@@ -256,28 +516,56 @@ fn font_spec(doc: &Document, fmt: &CellFormat) -> FontSpec {
         .unwrap_or_default()
 }
 
-fn build_layout(doc: &Document, fonts: &Fonts, scale: f32) -> Result<Layout, String> {
+fn build_layout(
+    doc: &Document,
+    fonts: &Fonts,
+    prep: &Prepared,
+    scale: f32,
+) -> Result<Layout, String> {
     // размер таблицы
     let mut ncols: u32 = 1;
     let mut nrows: u32 = 1;
     for row in &doc.rows {
-        nrows = nrows.max(row.index + 1);
+        nrows = nrows.max(row.index.saturating_add(1));
         for (col, _) in &row.cells {
-            ncols = ncols.max(col + 1);
+            ncols = ncols.max(col.saturating_add(1));
         }
     }
     for m in &doc.merges {
-        nrows = nrows.max(m.bottom + 1);
-        ncols = ncols.max(m.right + 1);
+        nrows = nrows.max(m.bottom.saturating_add(1));
+        ncols = ncols.max(m.right.saturating_add(1));
     }
     for (col, _) in &doc.default_group.columns {
-        ncols = ncols.max(col + 1);
+        ncols = ncols.max(col.saturating_add(1));
+    }
+    // Каждая строка занимает не меньше 1 px, поэтому строк больше
+    // MAX_DIMENSION картинка вместить не может. Проверка — до раскладки:
+    // номер строки из повреждённого файла (например, 2·10⁹) иначе приводит
+    // к выделению гигабайтов памяти под границы строк и аварийному
+    // завершению процесса 1С.
+    if nrows > MAX_DIMENSION {
+        return Err(format!(
+            "слишком много строк: {nrows} (предел {MAX_DIMENSION}) — \
+             картинка такой высоты невозможна или файл повреждён"
+        ));
+    }
+    if ncols > MAX_DIMENSION {
+        return Err(format!(
+            "слишком много колонок: {ncols} (предел {MAX_DIMENSION}) — \
+             картинка такой ширины невозможна или файл повреждён"
+        ));
     }
 
     // x-границы по группам колонок
     let groups: Vec<&crate::mxl_parser::ColumnGroup> = std::iter::once(&doc.default_group)
         .chain(doc.extra_groups.iter())
         .collect();
+    if groups.len().saturating_mul(ncols as usize + 1) > MAX_MERGE_INDEX_ENTRIES {
+        return Err(format!(
+            "слишком много групп колонок ({}) — файл, вероятно, повреждён",
+            groups.len()
+        ));
+    }
     let mut group_x = Vec::with_capacity(groups.len());
     for (gi, g) in groups.iter().enumerate() {
         let widths: HashMap<u32, u32> = g.columns.iter().copied().collect();
@@ -320,7 +608,7 @@ fn build_layout(doc: &Document, fonts: &Fonts, scale: f32) -> Result<Layout, Str
     }
 
     // объединения понадобятся для ширины переноса
-    let merge_of = merge_map(doc);
+    let merge_of = &prep.merges;
 
     // высоты строк
     let default_font = FontSpec::default();
@@ -359,10 +647,10 @@ fn build_layout(doc: &Document, fonts: &Fonts, scale: f32) -> Result<Layout, Str
                     let Some(text) = cell.text.as_deref().filter(|t| !t.trim().is_empty()) else {
                         continue;
                     };
-                    let fmt = effective_format(doc, row.format, cell);
-                    let spec = font_spec(doc, &fmt);
+                    let fmt = prep.format(row.format, cell);
+                    let spec = font_spec(doc, fmt);
                     let lh = line_height(fonts, &spec, scale);
-                    if is_vertical(&fmt) {
+                    if is_vertical(fmt) {
                         // вертикальный текст: высота должна вместить самую
                         // длинную строку текста
                         let widest = text
@@ -434,17 +722,9 @@ fn build_layout(doc: &Document, fonts: &Fonts, scale: f32) -> Result<Layout, Str
             .map(|xs| *xs.last().unwrap())
             .fold(0.0f32, f32::max);
     }
-    let width_px = content_right.ceil() as u32 + 2;
-    let height_px = *row_y.last().unwrap() as u32 + 2;
-    if width_px == 0 || height_px == 0 {
-        return Err("документ пуст — нечего рисовать".to_string());
-    }
-    if width_px > MAX_DIMENSION || height_px > MAX_DIMENSION {
-        return Err(format!(
-            "слишком большая картинка {width_px}x{height_px}px \
-             (предел стороны {MAX_DIMENSION}px) — уменьшите Масштаб"
-        ));
-    }
+    let width_px = (content_right.ceil() as u32).saturating_add(2);
+    let height_px = (*row_y.last().unwrap() as u32).saturating_add(2);
+    check_image_size(width_px as u64, height_px as u64, "уменьшите Масштаб")?;
     Ok(Layout {
         group_x,
         row_group_idx,
@@ -468,19 +748,6 @@ fn col_span_x(
     (xs[c], xs[c + 1])
 }
 
-/// (строка, колонка) → индекс объединения, покрывающего ячейку.
-fn merge_map(doc: &Document) -> HashMap<(u32, u32), usize> {
-    let mut map = HashMap::new();
-    for (i, m) in doc.merges.iter().enumerate() {
-        for r in m.top..=m.bottom {
-            for c in m.left..=m.right {
-                map.insert((r, c), i);
-            }
-        }
-    }
-    map
-}
-
 // ---------------------------------------------------------------------------
 // Рисование
 // ---------------------------------------------------------------------------
@@ -489,15 +756,15 @@ fn merge_map(doc: &Document) -> HashMap<(u32, u32), usize> {
 pub fn render(doc: &Document, scale_percent: u32) -> Result<Pixmap, String> {
     let scale = scale_percent as f32 / 100.0;
     let fonts = Fonts::load()?;
-    let layout = build_layout(doc, &fonts, scale)?;
+    let prep = Prepared::new(doc)?;
+    let layout = build_layout(doc, &fonts, &prep, scale)?;
     let mut pixmap = Pixmap::new(layout.width_px, layout.height_px)
         .ok_or_else(|| "не удалось создать буфер изображения".to_string())?;
     pixmap.fill(tiny_skia::Color::WHITE);
 
-    let merge_of = merge_map(doc);
-    draw_backgrounds(doc, &layout, &merge_of, &mut pixmap);
-    draw_borders(doc, &layout, &merge_of, &mut pixmap);
-    draw_texts(doc, &fonts, &layout, &merge_of, &mut pixmap);
+    draw_backgrounds(doc, &layout, &prep, &mut pixmap);
+    draw_borders(doc, &layout, &prep, &mut pixmap);
+    draw_texts(doc, &fonts, &layout, &prep, &mut pixmap);
     draw_drawings(doc, &fonts, &layout, &mut pixmap);
     Ok(pixmap)
 }
@@ -573,7 +840,7 @@ fn draw_drawings(doc: &Document, fonts: &Fonts, layout: &Layout, pixmap: &mut Pi
                 fill_rect(pixmap, x0, y0, t, y1 - y0, border_color);
                 fill_rect(pixmap, x1 - t, y0, t, y1 - y0, border_color);
                 if d.kind == DrawingKind::Text {
-                    let scaled = fonts.pick(&spec).as_scaled(font_px(&spec, scale));
+                    let scaled = fonts.scaled(&spec, font_px(&spec, scale));
                     let color = fmt
                         .text_color
                         .and_then(|i| doc.color_rgb(i))
@@ -586,6 +853,7 @@ fn draw_drawings(doc: &Document, fonts: &Fonts, layout: &Layout, pixmap: &mut Pi
                         }
                         draw_line_of_text(
                             pixmap,
+                            fonts,
                             &scaled,
                             line,
                             x0 + pad,
@@ -633,6 +901,25 @@ fn blit_image(pixmap: &mut Pixmap, rgba: &image::RgbaImage, x0: f32, y0: f32, x1
     }
 }
 
+/// Копирует `src` в `dst` левым верхним углом в точку (x, y) построчно
+/// (без смешивания). Части `src` за пределами `dst` отбрасываются.
+pub fn copy_pixmap(dst: &mut Pixmap, src: &Pixmap, x: u32, y: u32) {
+    let (dw, dh) = (dst.width() as usize, dst.height() as usize);
+    let (sw, sh) = (src.width() as usize, src.height() as usize);
+    let (x, y) = (x as usize, y as usize);
+    if x >= dw || y >= dh {
+        return;
+    }
+    let w = sw.min(dw - x) * 4;
+    let src_data = src.data();
+    let dst_data = dst.data_mut();
+    for row in 0..sh.min(dh - y) {
+        let s = row * sw * 4;
+        let d = ((y + row) * dw + x) * 4;
+        dst_data[d..d + w].copy_from_slice(&src_data[s..s + w]);
+    }
+}
+
 fn fill_rect(pixmap: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, color: Rgb) {
     if w <= 0.0 || h <= 0.0 {
         return;
@@ -674,16 +961,12 @@ fn fill_pattern_overlay(
 }
 
 /// Заливка фона ячеек, включая узоры (до рамок и текста).
-fn draw_backgrounds(
-    doc: &Document,
-    layout: &Layout,
-    merge_of: &HashMap<(u32, u32), usize>,
-    pixmap: &mut Pixmap,
-) {
+fn draw_backgrounds(doc: &Document, layout: &Layout, prep: &Prepared, pixmap: &mut Pixmap) {
+    let merge_of = &prep.merges;
     for row in &doc.rows {
         let r = row.index;
         for (col, cell) in &row.cells {
-            let fmt = effective_format(doc, row.format, cell);
+            let fmt = prep.format(row.format, cell);
             let bg = fmt.bg_color.and_then(|i| doc.color_rgb(i));
             let pattern = fmt.pattern.unwrap_or(PATTERN_NONE);
             // Узор заливается только при явном (абсолютном) цвете узора. Если
@@ -838,12 +1121,8 @@ fn draw_v_border(
     }
 }
 
-fn draw_borders(
-    doc: &Document,
-    layout: &Layout,
-    merge_of: &HashMap<(u32, u32), usize>,
-    pixmap: &mut Pixmap,
-) {
+fn draw_borders(doc: &Document, layout: &Layout, prep: &Prepared, pixmap: &mut Pixmap) {
+    let merge_of = &prep.merges;
     let scale = layout.scale;
     for row in &doc.rows {
         let r = row.index;
@@ -872,7 +1151,7 @@ fn draw_borders(
                     (a, b, c, d)
                 }
             };
-            let fmt = effective_format(doc, row.format, cell);
+            let fmt = prep.format(row.format, cell);
             let color = fmt
                 .borders_color
                 .and_then(|i| doc.color_rgb(i))
@@ -897,9 +1176,10 @@ fn draw_texts(
     doc: &Document,
     fonts: &Fonts,
     layout: &Layout,
-    merge_of: &HashMap<(u32, u32), usize>,
+    prep: &Prepared,
     pixmap: &mut Pixmap,
 ) {
+    let merge_of = &prep.merges;
     let scale = layout.scale;
     // тексты соседних ячеек, чтобы «выпускать» текст поверх пустых
     let occupied: HashMap<(u32, u32), bool> = doc
@@ -929,10 +1209,10 @@ fn draw_texts(
                     continue;
                 }
             }
-            let fmt = effective_format(doc, row.format, cell);
-            let spec = font_spec(doc, &fmt);
+            let fmt = prep.format(row.format, cell);
+            let spec = font_spec(doc, fmt);
             let px = font_px(&spec, scale);
-            let scaled = fonts.pick(&spec).as_scaled(px);
+            let scaled = fonts.scaled(&spec, px);
             let text_color = fmt
                 .text_color
                 .and_then(|i| doc.color_rgb(i))
@@ -948,7 +1228,7 @@ fn draw_texts(
 
             let pad = CELL_PAD_X * scale;
 
-            if is_vertical(&fmt) {
+            if is_vertical(fmt) {
                 let vlines: Vec<String> = text
                     .split('\n')
                     .map(|l| l.trim_end_matches('\r').to_string())
@@ -960,7 +1240,7 @@ fn draw_texts(
                     scale,
                     &vlines,
                     (x0, y0, x1, y1),
-                    &fmt,
+                    fmt,
                     text_color,
                 );
                 continue;
@@ -1060,6 +1340,7 @@ fn draw_texts(
                 let baseline = top + li as f32 * lh + scaled.ascent();
                 draw_line_of_text(
                     pixmap,
+                    fonts,
                     &scaled,
                     &line_to_draw,
                     tx,
@@ -1100,9 +1381,11 @@ fn blend_pixel(data: &mut [u8], width: usize, px: i32, py: i32, cov: f32, color:
 }
 
 /// Рисует одну строку текста с альфа-смешиванием, с отсечением по clip.
-fn draw_line_of_text<SF: ScaleFont<F>, F: Font>(
+#[allow(clippy::too_many_arguments)]
+fn draw_line_of_text(
     pixmap: &mut Pixmap,
-    scaled: &SF,
+    fonts: &Fonts,
+    scaled: &ScaledFace,
     line: &str,
     start_x: f32,
     baseline: f32,
@@ -1112,6 +1395,7 @@ fn draw_line_of_text<SF: ScaleFont<F>, F: Font>(
     let width = pixmap.width() as i32;
     let height = pixmap.height() as i32;
     let (cx0, cy0, cx1, cy1) = clip;
+    let data = pixmap.data_mut();
     let mut x = start_x;
     let mut prev = None;
     for ch in line.chars() {
@@ -1123,23 +1407,23 @@ fn draw_line_of_text<SF: ScaleFont<F>, F: Font>(
         if let Some(p) = prev {
             x += scaled.kern(p, id);
         }
-        let glyph = id.with_scale_and_position(scaled.scale(), ab_glyph::point(x, baseline));
-        if let Some(outlined) = scaled.font().outline_glyph(glyph) {
-            let bounds = outlined.px_bounds();
-            let data = pixmap.data_mut();
-            outlined.draw(|gx, gy, cov| {
-                let px = bounds.min.x as i32 + gx as i32;
-                let py = bounds.min.y as i32 + gy as i32;
+        let (bitmap, base_x, base_y) = fonts.glyph_bitmap(scaled, id, x, baseline);
+        if let Some(bitmap) = bitmap {
+            let min_x = (base_x + bitmap.min_x) as i32;
+            let min_y = (base_y + bitmap.min_y) as i32;
+            for (i, &cov) in bitmap.coverage.iter().enumerate() {
+                let px = min_x + (i % bitmap.w) as i32;
+                let py = min_y + (i / bitmap.w) as i32;
                 if px < 0 || py < 0 || px >= width || py >= height {
-                    return;
+                    continue;
                 }
                 let fx = px as f32;
                 let fy = py as f32;
                 if fx < cx0 - 0.5 || fx > cx1 - 0.5 || fy < cy0 || fy > cy1 {
-                    return;
+                    continue;
                 }
                 blend_pixel(data, width as usize, px, py, cov, color);
-            });
+            }
         }
         x += scaled.h_advance(id);
         prev = Some(id);
@@ -1162,7 +1446,7 @@ fn draw_vertical_text(
 ) {
     let (x0, y0, x1, y1) = rect;
     let px = font_px(spec, scale);
-    let scaled = fonts.pick(spec).as_scaled(px);
+    let scaled = fonts.scaled(spec, px);
     let lh = scaled.ascent() - scaled.descent();
     let pad = CELL_PAD_X * scale;
     let block_w = lines.len() as f32 * lh;
@@ -1184,16 +1468,18 @@ fn draw_vertical_text(
             _ => (y0 + y1 + lw) / 2.0,
         };
         let axis_x = left + li as f32 * lh + scaled.ascent();
-        draw_line_of_text_rotated(pixmap, &scaled, line, axis_x, bottom, rect, color);
+        draw_line_of_text_rotated(pixmap, fonts, &scaled, line, axis_x, bottom, rect, color);
     }
 }
 
 /// Рисует строку текста, повёрнутую на 90° против часовой стрелки
 /// (чтение снизу вверх). `axis_x` — x вертикальной базовой линии,
 /// `bottom_y` — y начала текста.
-fn draw_line_of_text_rotated<SF: ScaleFont<F>, F: Font>(
+#[allow(clippy::too_many_arguments)]
+fn draw_line_of_text_rotated(
     pixmap: &mut Pixmap,
-    scaled: &SF,
+    fonts: &Fonts,
+    scaled: &ScaledFace,
     line: &str,
     axis_x: f32,
     bottom_y: f32,
@@ -1203,6 +1489,7 @@ fn draw_line_of_text_rotated<SF: ScaleFont<F>, F: Font>(
     let width = pixmap.width() as i32;
     let height = pixmap.height() as i32;
     let (cx0, cy0, cx1, cy1) = clip;
+    let data = pixmap.data_mut();
     let mut pen = 0.0f32; // продвижение вдоль текста
     let mut prev = None;
     for ch in line.chars() {
@@ -1216,25 +1503,25 @@ fn draw_line_of_text_rotated<SF: ScaleFont<F>, F: Font>(
         }
         // глиф раскладывается в «горизонтальном» пространстве от (pen, 0),
         // затем каждый пиксель поворачивается: (dx, dy) → (dy, -dx)
-        let glyph = id.with_scale_and_position(scaled.scale(), ab_glyph::point(pen, 0.0));
-        if let Some(outlined) = scaled.font().outline_glyph(glyph) {
-            let bounds = outlined.px_bounds();
-            let data = pixmap.data_mut();
-            outlined.draw(|gx, gy, cov| {
-                let dx = bounds.min.x + gx as f32;
-                let dy = bounds.min.y + gy as f32;
+        let (bitmap, base_x, base_y) = fonts.glyph_bitmap(scaled, id, pen, 0.0);
+        if let Some(bitmap) = bitmap {
+            let min_x = base_x + bitmap.min_x;
+            let min_y = base_y + bitmap.min_y;
+            for (i, &cov) in bitmap.coverage.iter().enumerate() {
+                let dx = min_x + (i % bitmap.w) as f32;
+                let dy = min_y + (i / bitmap.w) as f32;
                 let tx = (axis_x + dy).round() as i32;
                 let ty = (bottom_y - dx).round() as i32;
                 if tx < 0 || ty < 0 || tx >= width || ty >= height {
-                    return;
+                    continue;
                 }
                 let fx = tx as f32;
                 let fy = ty as f32;
                 if fx < cx0 - 0.5 || fx > cx1 - 0.5 || fy < cy0 || fy > cy1 {
-                    return;
+                    continue;
                 }
                 blend_pixel(data, width as usize, tx, ty, cov, color);
-            });
+            }
         }
         pen += scaled.h_advance(id);
         prev = Some(id);
@@ -1245,31 +1532,25 @@ fn draw_line_of_text_rotated<SF: ScaleFont<F>, F: Font>(
 // Кодирование
 // ---------------------------------------------------------------------------
 
-/// Полный конвейер: модель → картинка в памяти (для возврата в 1С
-/// значением типа ДвоичныеДанные).
-pub fn convert_to_bytes(
-    doc: &Document,
-    kind: &ImageKind,
-    scale_percent: u32,
-) -> Result<Vec<u8>, String> {
-    let pixmap = render(doc, scale_percent)?;
-    encode_to_vec(&pixmap, kind)
+/// Размер в мегабайтах с одним знаком после запятой (для сообщений).
+fn megabytes(bytes: usize) -> String {
+    format!("{:.1}", bytes as f64 / 1_000_000.0)
 }
 
-/// Кодирует растровый буфер в JPEG или PNG в памяти с лимитом размера.
-pub fn encode_to_vec_limited(
+/// Кодирует растровый буфер в JPEG или PNG в памяти; результат больше
+/// `max_bytes` считается ошибкой.
+pub fn encode_to_vec(
     pixmap: &Pixmap,
     kind: &ImageKind,
     max_bytes: usize,
 ) -> Result<Vec<u8>, String> {
     let (w, h) = (pixmap.width(), pixmap.height());
-    // Pixmap хранит премультиплицированный RGBA; альфа везде 255,
-    // данные можно использовать напрямую, отбросив альфу.
-    let rgb: Vec<u8> = pixmap
-        .data()
-        .chunks_exact(4)
-        .flat_map(|p| [p[0], p[1], p[2]])
-        .collect();
+    // Pixmap хранит премультиплицированный RGBA; все этапы рендера дают
+    // непрозрачные пиксели (альфа 255), поэтому альфа просто отбрасывается.
+    let mut rgb = Vec::with_capacity(w as usize * h as usize * 3);
+    for p in pixmap.data().chunks_exact(4) {
+        rgb.extend_from_slice(&p[..3]);
+    }
     let mut out = Vec::new();
     match kind {
         ImageKind::Jpeg { quality } => {
@@ -1277,46 +1558,79 @@ pub fn encode_to_vec_limited(
             image::ImageEncoder::write_image(encoder, &rgb, w, h, image::ExtendedColorType::Rgb8)
                 .map_err(|e| format!("ошибка кодирования JPEG: {e}"))?;
         }
-        ImageKind::Png => {
-            let encoder = image::codecs::png::PngEncoder::new(&mut out);
+        ImageKind::Png { compression } => {
+            use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+            let compression = match compression {
+                PngCompression::Fast => CompressionType::Fast,
+                PngCompression::Default => CompressionType::Default,
+                PngCompression::Best => CompressionType::Best,
+            };
+            let encoder = PngEncoder::new_with_quality(&mut out, compression, FilterType::Adaptive);
             image::ImageEncoder::write_image(encoder, &rgb, w, h, image::ExtendedColorType::Rgb8)
                 .map_err(|e| format!("ошибка кодирования PNG: {e}"))?;
         }
     }
     if out.len() > max_bytes {
+        let hint = match kind {
+            ImageKind::Jpeg { .. } => "уменьшите Масштаб или Качество",
+            ImageKind::Png { .. } => "уменьшите Масштаб, выберите JPEG или СжатиеPNG = 2",
+        };
         return Err(format!(
-            "слишком большая картинка: {} МБ (предел {} МБ) — уменьшите Масштаб",
-            out.len() / 1024 / 1024,
-            max_bytes / 1024 / 1024
+            "слишком большая картинка: {} МБ (предел МаксимальныйРазмерКартинки — {} МБ) — \
+             {hint} либо увеличьте МаксимальныйРазмерКартинки",
+            megabytes(out.len()),
+            megabytes(max_bytes)
         ));
     }
     Ok(out)
 }
 
-/// Кодирует растровый буфер в JPEG или PNG в памяти.
-pub fn encode_to_vec(pixmap: &Pixmap, kind: &ImageKind) -> Result<Vec<u8>, String> {
-    encode_to_vec_limited(pixmap, kind, 50 * 1024 * 1024)
-}
-
-/// Кодирует растровый буфер в файл JPEG или PNG с лимитом размера.
-pub fn encode_limited(
+/// Кодирует растровый буфер в файл JPEG или PNG (см. [`encode_to_vec`]).
+///
+/// Запись атомарная: данные пишутся во временный файл рядом с целевым и
+/// затем переименовываются, поэтому при ошибке записи (нет места на диске и
+/// т.п.) на месте картинки не остаётся обрезанный файл, а прежний файл с
+/// тем же именем сохраняется.
+pub fn encode_to_file(
     pixmap: &Pixmap,
     path: &Path,
     kind: &ImageKind,
     max_bytes: usize,
 ) -> Result<(), String> {
-    let bytes = encode_to_vec_limited(pixmap, kind, max_bytes)?;
-    let file = std::fs::File::create(path)
-        .map_err(|e| format!("не удалось создать файл {}: {e}", path.display()))?;
-    let mut writer = BufWriter::new(file);
-    std::io::Write::write_all(&mut writer, &bytes)
-        .map_err(|e| format!("не удалось записать файл {}: {e}", path.display()))?;
-    Ok(())
+    let bytes = encode_to_vec(pixmap, kind, max_bytes)?;
+    write_atomically(path, &bytes)
 }
 
-/// Кодирует растровый буфер в файл JPEG или PNG.
-pub fn encode(pixmap: &Pixmap, path: &Path, kind: &ImageKind) -> Result<(), String> {
-    encode_limited(pixmap, path, kind, 50 * 1024 * 1024)
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("не задано имя файла картинки: {}", path.display()))?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(file_name);
+    tmp_name.push(format!(
+        ".{}-{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp_path = path.with_file_name(tmp_name);
+
+    let result = (|| {
+        let mut file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("не удалось создать файл {}: {e}", path.display()))?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| format!("не удалось записать файл {}: {e}", path.display()))?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)
+            .map_err(|e| format!("не удалось записать файл {}: {e}", path.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1326,7 +1640,7 @@ pub fn encode(pixmap: &Pixmap, path: &Path, kind: &ImageKind) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mxl_parser::{parse_file, Row};
+    use crate::mxl_parser::{parse_file, FontSpec, Merge, Row};
     use std::path::PathBuf;
 
     fn mxl(name: &str) -> PathBuf {
@@ -1392,7 +1706,7 @@ mod tests {
         let jpg = out_dir().join("synthetic.jpg");
         let png = out_dir().join("synthetic.png");
         convert(&doc, &jpg, &ImageKind::Jpeg { quality: 90 }, 100).unwrap();
-        convert(&doc, &png, &ImageKind::Png, 100).unwrap();
+        convert(&doc, &png, &ImageKind::PNG, 100).unwrap();
         let img = image::open(&png).unwrap();
         assert!(img.width() > 10 && img.height() > 5);
         // текст и рамки дают тёмные пиксели
@@ -1678,7 +1992,7 @@ mod tests {
         let jpg = out_dir().join("akt.jpg");
         let png = out_dir().join("akt.png");
         convert(&doc, &jpg, &ImageKind::Jpeg { quality: 90 }, 100).unwrap();
-        convert(&doc, &png, &ImageKind::Png, 100).unwrap();
+        convert(&doc, &png, &ImageKind::PNG, 100).unwrap();
         // валидность: декодируется обратно и размеры совпадают
         let img = image::open(&jpg).unwrap();
         let img2 = image::open(&png).unwrap();
@@ -1757,7 +2071,8 @@ mod tests {
         // ячейка «Узор 17» (строка 7, колонка 0): фон + штриховка цветом
         // узора дают минимум два разных цвета внутри ячейки
         let fonts = Fonts::load().unwrap();
-        let layout = build_layout(&doc, &fonts, 1.0).unwrap();
+        let prep = Prepared::new(&doc).unwrap();
+        let layout = build_layout(&doc, &fonts, &prep, 1.0).unwrap();
         let (x0, x1) = layout.col_x(7, 0);
         let (y0, y1) = layout.row_range(7);
         let mut distinct = std::collections::HashSet::new();
@@ -1788,5 +2103,209 @@ mod tests {
         let dark = pm.data().chunks_exact(4).filter(|p| p[0] < 128).count();
         // на картинке должно быть заметное количество тёмных пикселей (текст)
         assert!(dark > 1000, "тёмных пикселей всего {dark}");
+    }
+
+    /// Документ из одной ячейки с текстом в строке `row`, колонке `col`.
+    fn one_cell_doc(row: u32, col: u32) -> Document {
+        Document {
+            rows: vec![Row {
+                index: row,
+                format: 0,
+                cells: vec![(
+                    col,
+                    Cell {
+                        format: 0,
+                        text: Some("x".to_string()),
+                    },
+                )],
+            }],
+            ..Document::default()
+        }
+    }
+
+    #[test]
+    fn huge_row_or_column_index_is_rejected_before_layout() {
+        // раньше: выделение ~8 ГБ под границы строк и аварийное завершение
+        for (row, col) in [
+            (2_000_000_000, 0),
+            (u32::MAX, 0),
+            (0, 2_000_000_000),
+            (0, u32::MAX),
+        ] {
+            let started = std::time::Instant::now();
+            let e = render(&one_cell_doc(row, col), 100).unwrap_err();
+            assert!(e.contains("слишком много"), "{e}");
+            assert!(started.elapsed().as_secs() < 2);
+        }
+    }
+
+    #[test]
+    fn huge_merge_does_not_hang() {
+        // раньше: карта «ячейка → объединение» на 10¹⁰ записей
+        let mut doc = synthetic_doc();
+        doc.merges.push(Merge {
+            left: 0,
+            top: 0,
+            right: 60_000,
+            bottom: 60_000,
+        });
+        let started = std::time::Instant::now();
+        let e = render(&doc, 100).unwrap_err();
+        assert!(e.contains("слишком большая картинка"), "{e}");
+        assert!(started.elapsed().as_secs() < 2);
+    }
+
+    #[test]
+    fn too_many_merge_index_entries_are_rejected() {
+        // 200 перекрывающихся объединений по 60 000 строк каждое
+        let mut doc = Document::default();
+        for r in 0..60_000 {
+            doc.rows.push(Row {
+                index: r,
+                format: 0,
+                cells: vec![],
+            });
+        }
+        for _ in 0..200 {
+            doc.merges.push(Merge {
+                left: 0,
+                top: 0,
+                right: 1,
+                bottom: 59_999,
+            });
+        }
+        let e = Prepared::new(&doc).err().unwrap();
+        assert!(e.contains("объединений"), "{e}");
+    }
+
+    #[test]
+    fn merge_index_finds_covering_merge() {
+        let doc = Document {
+            rows: (0..5)
+                .map(|index| Row {
+                    index,
+                    format: 0,
+                    cells: vec![],
+                })
+                .collect(),
+            merges: vec![
+                Merge {
+                    left: 1,
+                    top: 1,
+                    right: 2,
+                    bottom: 3,
+                },
+                Merge {
+                    left: 4,
+                    top: 0,
+                    right: 6,
+                    bottom: 0,
+                },
+            ],
+            ..Document::default()
+        };
+        let index = MergeIndex::new(&doc).unwrap();
+        assert_eq!(index.get(&(1, 1)), Some(&0));
+        assert_eq!(index.get(&(3, 2)), Some(&0));
+        assert_eq!(index.get(&(4, 2)), None);
+        assert_eq!(index.get(&(2, 0)), None);
+        assert_eq!(index.get(&(2, 3)), None);
+        assert_eq!(index.get(&(0, 5)), Some(&1));
+        assert!(!index.contains_key(&(0, 7)));
+    }
+
+    #[test]
+    fn image_size_limits() {
+        assert!(check_image_size(65_500, 3_000, "x").is_ok());
+        assert!(check_image_size(65_501, 1, "x").is_err());
+        let e = check_image_size(20_000, 20_000, "уменьшите Масштаб").unwrap_err();
+        assert!(
+            e.contains("Мпикс") && e.contains("уменьшите Масштаб"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn wrap_matches_reference_implementation() {
+        // эталон — прежний алгоритм с полным пересчётом ширины кандидата
+        fn reference(fonts: &Fonts, spec: &FontSpec, text: &str, max_w: f32) -> Vec<String> {
+            let mut lines = Vec::new();
+            for raw_line in text.split('\n') {
+                let raw_line = raw_line.trim_end_matches('\r');
+                if text_width(fonts, spec, 1.0, raw_line) <= max_w {
+                    lines.push(raw_line.to_string());
+                    continue;
+                }
+                let mut current = String::new();
+                for word in raw_line.split(' ') {
+                    let candidate = if current.is_empty() {
+                        word.to_string()
+                    } else {
+                        format!("{current} {word}")
+                    };
+                    if text_width(fonts, spec, 1.0, &candidate) <= max_w || current.is_empty() {
+                        current = candidate;
+                    } else {
+                        lines.push(std::mem::take(&mut current));
+                        current = word.to_string();
+                    }
+                }
+                if !current.is_empty() {
+                    lines.push(current);
+                }
+            }
+            if lines.is_empty() {
+                lines.push(String::new());
+            }
+            lines
+        }
+        let fonts = Fonts::load().unwrap();
+        let spec = FontSpec::default();
+        let texts = [
+            "Поставщик: ООО «Ромашка», ИНН 7700000000, г. Москва, ул. Ленина, д. 1",
+            "  двойные  пробелы   и\r\nперевод строки",
+            "оченьдлинноесловобезпробеловкотороене помещается",
+            "",
+            " ",
+        ];
+        for text in texts {
+            for max_w in [4.0, 30.0, 80.0, 150.0, 1000.0] {
+                assert_eq!(
+                    wrap_text(&fonts, &spec, 1.0, text, max_w),
+                    reference(&fonts, &spec, text, max_w),
+                    "{text:?} @ {max_w}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encode_to_file_replaces_file_atomically() {
+        let dir = out_dir();
+        let path = dir.join("atomic.png");
+        std::fs::write(&path, b"old").unwrap();
+        let pm = render(&synthetic_doc(), 100).unwrap();
+        encode_to_file(&pm, &path, &ImageKind::PNG, DEFAULT_MAX_IMAGE_BYTES).unwrap();
+        assert!(std::fs::read(&path).unwrap().starts_with(b"\x89PNG"));
+        // при ошибке (превышен предел размера) прежний файл не тронут
+        let e = encode_to_file(&pm, &path, &ImageKind::PNG, 10).unwrap_err();
+        assert!(e.contains("МаксимальныйРазмерКартинки"), "{e}");
+        assert!(std::fs::read(&path).unwrap().starts_with(b"\x89PNG"));
+        // временных файлов не осталось
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".atomic.png"))
+            .collect();
+        assert!(leftovers.is_empty());
+        // в несуществующий каталог — понятная ошибка
+        let e = encode_to_file(
+            &pm,
+            &dir.join("no/such/dir.png"),
+            &ImageKind::PNG,
+            DEFAULT_MAX_IMAGE_BYTES,
+        )
+        .unwrap_err();
+        assert!(e.contains("не удалось создать файл"), "{e}");
     }
 }

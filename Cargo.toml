@@ -15,3 +15,5 @@ native_api_1c_macro = { path = "native_api_1c/native_api_1c_macro" }
 [profile.release]
 lto = true
 strip = true
+# одна единица кодогенерации — лучше оптимизация и меньше размер DLL/SO
+codegen-units = 1
