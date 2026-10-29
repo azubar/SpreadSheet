@@ -1736,7 +1736,7 @@ pub fn encode_to_vec(
     // Pixmap хранит премультиплицированный RGBA; все этапы рендера дают
     // непрозрачные пиксели (альфа 255), поэтому альфа просто отбрасывается.
     let mut rgb = Vec::with_capacity(w as usize * h as usize * 3);
-    for p in pixmap.data().chunks_exact(4) {
+    for p in pixmap.data().as_chunks::<4>().0.iter() {
         rgb.extend_from_slice(&p[..3]);
     }
     let mut out = Vec::new();
@@ -1899,7 +1899,13 @@ mod tests {
         assert!(img.width() > 10 && img.height() > 5);
         // текст и рамки дают тёмные пиксели
         let pm = render(&doc, 100).unwrap();
-        let dark = pm.data().chunks_exact(4).filter(|p| p[0] < 128).count();
+        let dark = pm
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] < 128)
+            .count();
         assert!(dark > 50, "тёмных пикселей всего {dark}");
     }
 
@@ -1981,10 +1987,18 @@ mod tests {
         };
         let pm_normal = render(&doc_normal, 100).unwrap();
 
-        let dark_block = pm.data().chunks_exact(4).filter(|p| p[0] < 128).count();
+        let dark_block = pm
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] < 128)
+            .count();
         let dark_normal = pm_normal
             .data()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] < 128)
             .count();
 
@@ -2089,7 +2103,9 @@ mod tests {
         let total = (pm.width() * pm.height()) as usize;
         let black = pm
             .data()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] < 30 && p[1] < 30 && p[2] < 30)
             .count();
         assert!(
@@ -2231,7 +2247,7 @@ mod tests {
         let pm = render(&doc, 100).unwrap();
         let mut has_red = false;
         let mut has_title_blue = false;
-        for p in pm.data().chunks_exact(4) {
+        for p in pm.data().as_chunks::<4>().0.iter() {
             if p[0] > 200 && p[1] < 60 && p[2] < 60 {
                 has_red = true;
             }
@@ -2275,7 +2291,9 @@ mod tests {
         // логотипа (не из палитры документа)
         let non_white = pm
             .data()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] < 250 || p[1] < 250 || p[2] < 250)
             .count();
         assert!(non_white > 10_000, "слишком пустой рендер: {non_white}");
@@ -2288,7 +2306,13 @@ mod tests {
         }
         let doc = parse_file(&mxl("Сетка.mxl")).unwrap();
         let pm = render(&doc, 100).unwrap();
-        let dark = pm.data().chunks_exact(4).filter(|p| p[0] < 128).count();
+        let dark = pm
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] < 128)
+            .count();
         // на картинке должно быть заметное количество тёмных пикселей (текст)
         assert!(dark > 1000, "тёмных пикселей всего {dark}");
     }
@@ -2654,14 +2678,22 @@ mod tests {
         let mut doc = synthetic_doc();
         doc.rows[0].cells[0].1.text = Some("✓✓✓".to_string());
         let pm = render(&doc, 300).unwrap();
-        let dark = pm.data().chunks_exact(4).filter(|p| p[0] < 100).count();
+        let dark = pm
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] < 100)
+            .count();
         // рамка + глифы (без запасного шрифта рисовались бы пустые .notdef)
         let mut empty = synthetic_doc();
         empty.rows[0].cells[0].1.text = None;
         let frame = render(&empty, 300)
             .unwrap()
             .data()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] < 100)
             .count();
         assert!(dark > frame + 100, "глифов нет: {dark} vs {frame}");

@@ -107,8 +107,10 @@ fn rgba_to_opaque_pixmap(rgba: &image::RgbaImage) -> Result<tiny_skia::Pixmap, S
         .ok_or_else(|| "не удалось создать буфер изображения страницы PDF".to_string())?;
     for (dst, src) in pixmap
         .data_mut()
-        .chunks_exact_mut(4)
-        .zip(rgba.as_raw().chunks_exact(4))
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(rgba.as_raw().as_chunks::<4>().0.iter())
     {
         let a = src[3] as u16;
         for c in 0..3 {
