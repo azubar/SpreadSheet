@@ -428,14 +428,30 @@ fn text_width(fonts: &Fonts, spec: &FontSpec, scale: f32, text: &str) -> f32 {
 /// Перенос текста по словам под заданную ширину. Ширина строки-кандидата
 /// наращивается по словам, а не пересчитывается целиком (линейное время).
 fn wrap_text(fonts: &Fonts, spec: &FontSpec, scale: f32, text: &str, max_w: f32) -> Vec<String> {
+    wrap_text_paragraphs(fonts, spec, scale, text, max_w)
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect()
+}
+
+/// Перенос по словам с признаком «последняя строка абзаца» (для
+/// выравнивания по ширине: последняя строка абзаца не растягивается).
+fn wrap_text_paragraphs(
+    fonts: &Fonts,
+    spec: &FontSpec,
+    scale: f32,
+    text: &str,
+    max_w: f32,
+) -> Vec<(String, bool)> {
     let f = fonts.scaled(spec, font_px(spec, scale));
-    let mut lines = Vec::new();
+    let mut lines: Vec<(String, bool)> = Vec::new();
     for raw_line in text.split('\n') {
         let raw_line = raw_line.trim_end_matches('\r');
         if measure_more(&f, (0.0, None), raw_line).0 <= max_w {
-            lines.push(raw_line.to_string());
+            lines.push((raw_line.to_string(), true));
             continue;
         }
+        let paragraph_start = lines.len();
         let mut current = String::new();
         let mut current_m: Measure = (0.0, None);
         for word in raw_line.split(' ') {
@@ -450,17 +466,20 @@ fn wrap_text(fonts: &Fonts, spec: &FontSpec, scale: f32, text: &str, max_w: f32)
                 current.push_str(word);
                 current_m = candidate_m;
             } else {
-                lines.push(std::mem::take(&mut current));
+                lines.push((std::mem::take(&mut current), false));
                 current.push_str(word);
                 current_m = measure_more(&f, (0.0, None), word);
             }
         }
         if !current.is_empty() {
-            lines.push(current);
+            lines.push((current, false));
+        }
+        if let Some(last) = lines[paragraph_start..].last_mut() {
+            last.1 = true;
         }
     }
     if lines.is_empty() {
-        lines.push(String::new());
+        lines.push((String::new(), true));
     }
     lines
 }
@@ -576,6 +595,7 @@ fn effective_format(doc: &Document, row_format: u32, cell: &Cell) -> CellFormat 
         pattern_color: top.pattern_color.or(base.pattern_color),
         text_control: top.text_control.or(base.text_control),
         orientation: top.orientation.or(base.orientation),
+        number_format: top.number_format.or(base.number_format),
     }
 }
 
@@ -614,6 +634,25 @@ const ORIENT_VERTICAL: u32 = 900;
 
 fn is_vertical(fmt: &CellFormat) -> bool {
     fmt.orientation == Some(ORIENT_VERTICAL)
+}
+
+/// Угол поворота текста в градусах (против часовой стрелки) для углов,
+/// отличных от 0° и 90° (90° — отдельный путь вертикального текста).
+fn text_angle(fmt: &CellFormat) -> Option<f32> {
+    let tenths = fmt.orientation? % 3600;
+    if tenths == 0 || tenths == ORIENT_VERTICAL {
+        return None;
+    }
+    Some(tenths as f32 / 10.0)
+}
+
+/// Размер описывающего прямоугольника блока `w × h`, повёрнутого на `angle`°.
+fn rotated_size(w: f32, h: f32, angle: f32) -> (f32, f32) {
+    let (sin, cos) = angle.to_radians().sin_cos();
+    (
+        (w * cos).abs() + (h * sin).abs(),
+        (w * sin).abs() + (h * cos).abs(),
+    )
 }
 
 fn font_spec(doc: &Document, fmt: &CellFormat) -> FontSpec {
@@ -751,6 +790,18 @@ fn build_layout(
                             .map(|l| text_width(fonts, &spec, scale, l.trim_end_matches('\r')))
                             .fold(0.0f32, f32::max);
                         content_h = content_h.max(widest + CELL_PAD_Y * scale);
+                        continue;
+                    }
+                    if let Some(angle) = text_angle(fmt) {
+                        // повёрнутый текст: высота повёрнутого блока строк
+                        let lines: Vec<&str> =
+                            text.split('\n').map(|l| l.trim_end_matches('\r')).collect();
+                        let widest = lines
+                            .iter()
+                            .map(|l| text_width(fonts, &spec, scale, l))
+                            .fold(0.0f32, f32::max);
+                        let (_, h) = rotated_size(widest, lines.len() as f32 * lh, angle);
+                        content_h = content_h.max(h + CELL_PAD_Y * scale);
                         continue;
                     }
                     let mut lines = if fmt.text_control == Some(3) {
@@ -1749,14 +1800,35 @@ fn draw_texts(
                 );
                 continue;
             }
+            if let Some(angle) = text_angle(fmt) {
+                let rlines: Vec<String> = text
+                    .split('\n')
+                    .map(|l| l.trim_end_matches('\r').to_string())
+                    .collect();
+                draw_rotated_text(
+                    pixmap,
+                    fonts,
+                    &spec,
+                    scale,
+                    &rlines,
+                    (x0, y0, x1, y1),
+                    fmt,
+                    text_color,
+                    angle,
+                );
+                continue;
+            }
             let control = fmt.text_control.unwrap_or(0);
             let h_align = fmt.h_align.unwrap_or(0);
-            let lines: Vec<String> = if control == 3 {
-                wrap_text(fonts, &spec, scale, text, (x1 - x0 - 2.0 * pad).max(4.0))
+            // строки и признак «последняя в абзаце» (для выравнивания по ширине)
+            let (lines, paragraph_ends): (Vec<String>, Vec<bool>) = if control == 3 {
+                wrap_text_paragraphs(fonts, &spec, scale, text, (x1 - x0 - 2.0 * pad).max(4.0))
+                    .into_iter()
+                    .unzip()
             } else {
                 text.split('\n')
-                    .map(|l| l.trim_end_matches('\r').to_string())
-                    .collect()
+                    .map(|l| (l.trim_end_matches('\r').to_string(), true))
+                    .unzip()
             };
 
             // «выпуск» текста на соседние пустые ячейки (контроль = авто)
@@ -1831,6 +1903,33 @@ fn draw_texts(
                     }
                 }
 
+                let baseline = top + li as f32 * lh + scaled.ascent();
+                // по ширине: строка переноса, кроме последней в абзаце,
+                // растягивается на ширину ячейки за счёт пробелов
+                if h_align == 4 && control != 2 && !paragraph_ends[li] {
+                    let avail = x1 - x0 - 2.0 * pad;
+                    if let Some(lw) = draw_justified_line(
+                        pixmap,
+                        fonts,
+                        &scaled,
+                        (&spec, scale),
+                        line,
+                        (x0 + pad, baseline, avail),
+                        (clip_x0, y0, clip_x1, y1),
+                        text_color,
+                    ) {
+                        let deco_t = scale.max(1.0).round();
+                        if spec.underline {
+                            let uy = (baseline + 1.5 * scale).min(y1 - 1.0);
+                            fill_rect(pixmap, x0 + pad, uy, lw, deco_t, text_color);
+                        }
+                        if spec.strikeout {
+                            let sy = baseline - scaled.ascent() * 0.35;
+                            fill_rect(pixmap, x0 + pad, sy, lw, deco_t, text_color);
+                        }
+                        continue;
+                    }
+                }
                 let lw = text_width(fonts, &spec, scale, &line_to_draw);
                 let tx = if control == 2 {
                     x0 + pad
@@ -1841,7 +1940,6 @@ fn draw_texts(
                         _ => x0 + pad,
                     }
                 };
-                let baseline = top + li as f32 * lh + scaled.ascent();
                 draw_line_of_text(
                     pixmap,
                     fonts,
@@ -1931,6 +2029,176 @@ fn draw_line_of_text(
         }
         x += scaled.h_advance(g);
         prev = Some(g);
+    }
+}
+
+/// Рисует строку по ширине: слова расставляются так, что строка занимает
+/// ширину `avail` от `x`. Возвращает ширину строки или `None`, если
+/// растягивать нечего (одно слово) или строка шире области.
+#[allow(clippy::too_many_arguments)]
+fn draw_justified_line(
+    pixmap: &mut Pixmap,
+    fonts: &Fonts,
+    scaled: &ScaledFace,
+    (spec, scale): (&FontSpec, f32),
+    line: &str,
+    (x, baseline, avail): (f32, f32, f32),
+    clip: (f32, f32, f32, f32),
+    color: Rgb,
+) -> Option<f32> {
+    let words: Vec<&str> = line.split(' ').filter(|w| !w.is_empty()).collect();
+    if words.len() < 2 {
+        return None;
+    }
+    let widths: Vec<f32> = words
+        .iter()
+        .map(|w| text_width(fonts, spec, scale, w))
+        .collect();
+    let gap = (avail - widths.iter().sum::<f32>()) / (words.len() - 1) as f32;
+    if gap <= 0.0 {
+        return None;
+    }
+    let mut pen = x;
+    for (word, w) in words.iter().zip(&widths) {
+        draw_line_of_text(pixmap, fonts, scaled, word, pen, baseline, clip, color);
+        pen += w + gap;
+    }
+    Some(avail)
+}
+
+/// Рисует блок строк, повёрнутый на `angle`° против часовой стрелки.
+/// Строки растеризуются в буфер покрытия, который затем поворачивается
+/// обратным отображением с билинейной выборкой (без «дыр» при углах,
+/// не кратных 90°). Повёрнутый блок выравнивается в ячейке по
+/// горизонтали и вертикали (по умолчанию — по центру).
+#[allow(clippy::too_many_arguments)]
+fn draw_rotated_text(
+    pixmap: &mut Pixmap,
+    fonts: &Fonts,
+    spec: &FontSpec,
+    scale: f32,
+    lines: &[String],
+    rect: (f32, f32, f32, f32),
+    fmt: &CellFormat,
+    color: Rgb,
+    angle: f32,
+) {
+    let (x0, y0, x1, y1) = rect;
+    let scaled = fonts.scaled(spec, font_px(spec, scale));
+    let lh = scaled.ascent() - scaled.descent();
+    let widths: Vec<f32> = lines
+        .iter()
+        .map(|l| text_width(fonts, spec, scale, l))
+        .collect();
+    let block_w = widths.iter().copied().fold(0.0f32, f32::max);
+    let block_h = lines.len() as f32 * lh;
+    if block_w < 1.0 {
+        return;
+    }
+    // растр блока: покрытие 0..1
+    let bw = block_w.ceil() as usize + 2;
+    let bh = block_h.ceil() as usize + 2;
+    if bw * bh > 50_000_000 {
+        return;
+    }
+    let mut coverage = vec![0.0f32; bw * bh];
+    for (li, (line, lw)) in lines.iter().zip(&widths).enumerate() {
+        let start = match fmt.h_align.unwrap_or(6) {
+            0 | 4 => 1.0,
+            2 => 1.0 + block_w - lw,
+            _ => 1.0 + (block_w - lw) / 2.0,
+        };
+        let baseline = 1.0 + li as f32 * lh + scaled.ascent();
+        let mut pen = start;
+        let mut prev = None;
+        for ch in line.chars() {
+            if ch.is_control() {
+                prev = None;
+                continue;
+            }
+            let g = scaled.glyph(ch);
+            if let Some(p) = prev {
+                pen += scaled.kern(p, g);
+            }
+            let (bitmap, base_x, base_y) = fonts.glyph_bitmap(&scaled, g, pen, baseline);
+            if let Some(bitmap) = bitmap {
+                let min_x = (base_x + bitmap.min_x) as i32;
+                let min_y = (base_y + bitmap.min_y) as i32;
+                for (i, &cov) in bitmap.coverage.iter().enumerate() {
+                    let px = min_x + (i % bitmap.w) as i32;
+                    let py = min_y + (i / bitmap.w) as i32;
+                    if px >= 0 && py >= 0 && (px as usize) < bw && (py as usize) < bh {
+                        let c = &mut coverage[py as usize * bw + px as usize];
+                        *c = (*c + cov).min(1.0);
+                    }
+                }
+            }
+            pen += scaled.h_advance(g);
+            prev = Some(g);
+        }
+    }
+
+    // положение повёрнутого блока в ячейке
+    let (rw, rh) = rotated_size(bw as f32, bh as f32, angle);
+    let pad = CELL_PAD_X * scale;
+    let cx = match fmt.h_align.unwrap_or(6) {
+        0 | 4 => x0 + pad + rw / 2.0,
+        2 => x1 - pad - rw / 2.0,
+        _ => (x0 + x1) / 2.0,
+    };
+    let cy = match fmt.v_align.unwrap_or(24) {
+        0 => y0 + pad + rh / 2.0,
+        8 => y1 - pad - rh / 2.0,
+        _ => (y0 + y1) / 2.0,
+    };
+    // угол повёрнутого блока — в целых пикселях: при углах, кратных 90°,
+    // выборка попадает точно в пиксели растра (без размытия)
+    let cx = (cx - rw / 2.0).round() + rw / 2.0;
+    let cy = (cy - rh / 2.0).round() + rh / 2.0;
+    let (sin, cos) = angle.to_radians().sin_cos();
+    let (scx, scy) = (bw as f32 / 2.0, bh as f32 / 2.0);
+    let width = pixmap.width() as i32;
+    let height = pixmap.height() as i32;
+    let left = ((cx - rw / 2.0).floor() as i32)
+        .max(x0.floor() as i32)
+        .max(0);
+    let right = ((cx + rw / 2.0).ceil() as i32)
+        .min(x1.ceil() as i32)
+        .min(width);
+    let top = ((cy - rh / 2.0).floor() as i32)
+        .max(y0.floor() as i32)
+        .max(0);
+    let bottom = ((cy + rh / 2.0).ceil() as i32)
+        .min(y1.ceil() as i32)
+        .min(height);
+    let sample = |x: f32, y: f32| -> f32 {
+        let (fx, fy) = (x.floor(), y.floor());
+        let (ix, iy) = (fx as i64, fy as i64);
+        let (tx, ty) = (x - fx, y - fy);
+        let at = |ax: i64, ay: i64| -> f32 {
+            if ax < 0 || ay < 0 || ax as usize >= bw || ay as usize >= bh {
+                0.0
+            } else {
+                coverage[ay as usize * bw + ax as usize]
+            }
+        };
+        let top = at(ix, iy) * (1.0 - tx) + at(ix + 1, iy) * tx;
+        let bottom = at(ix, iy + 1) * (1.0 - tx) + at(ix + 1, iy + 1) * tx;
+        top * (1.0 - ty) + bottom * ty
+    };
+    let data = pixmap.data_mut();
+    for py in top..bottom {
+        for px in left..right {
+            // центр пикселя относительно центра блока на странице
+            let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
+            // обратный поворот (поворот против часовой при оси y вниз)
+            let sx = dx * cos - dy * sin + scx - 0.5;
+            let sy = dx * sin + dy * cos + scy - 0.5;
+            let cov = sample(sx, sy);
+            if cov > 0.0 {
+                blend_pixel(data, width as usize, px, py, cov, color);
+            }
+        }
     }
 }
 
@@ -2287,6 +2555,7 @@ mod tests {
                     Cell {
                         format: 1,
                         text: Some("Тестова комірка".to_string()),
+                        value: None,
                     },
                 )],
             }],
@@ -2364,6 +2633,7 @@ mod tests {
                     Cell {
                         format: 1,
                         text: Some("*".to_string()),
+                        value: None,
                     },
                 )],
             }],
@@ -2386,6 +2656,7 @@ mod tests {
                     Cell {
                         format: 1,
                         text: Some("*".to_string()),
+                        value: None,
                     },
                 )],
             }],
@@ -2442,6 +2713,7 @@ mod tests {
                         Cell {
                             format: 0,
                             text: Some("A".into()),
+                            value: None,
                         },
                     )],
                 },
@@ -2453,6 +2725,7 @@ mod tests {
                         Cell {
                             format: 0,
                             text: Some("B".into()),
+                            value: None,
                         },
                     )],
                 },
@@ -2500,6 +2773,7 @@ mod tests {
                     Cell {
                         format: 1,
                         text: Some("X".into()),
+                        value: None,
                     },
                 )],
             }],
@@ -2546,6 +2820,7 @@ mod tests {
                             Cell {
                                 format: 0,
                                 text: Some("Верх".into()),
+                                value: None,
                             },
                         ),
                         (
@@ -2553,6 +2828,7 @@ mod tests {
                             Cell {
                                 format: 0,
                                 text: Some("A".into()),
+                                value: None,
                             },
                         ),
                     ],
@@ -2566,6 +2842,7 @@ mod tests {
                             Cell {
                                 format: 0,
                                 text: None,
+                                value: None,
                             },
                         ),
                         (
@@ -2573,6 +2850,7 @@ mod tests {
                             Cell {
                                 format: 0,
                                 text: row1_text.map(str::to_string),
+                                value: None,
                             },
                         ),
                     ],
@@ -2734,6 +3012,7 @@ mod tests {
                     Cell {
                         format: 0,
                         text: Some("x".to_string()),
+                        value: None,
                     },
                 )],
             }],
@@ -3041,6 +3320,7 @@ mod tests {
                     Cell {
                         format: 0,
                         text: Some(format!("строка {r}")),
+                        value: None,
                     },
                 )],
             });
@@ -3133,6 +3413,7 @@ mod tests {
         let text = |t: &str| Cell {
             format: 0,
             text: Some(t.to_string()),
+            value: None,
         };
         Document {
             formats: vec![
@@ -3318,5 +3599,149 @@ mod tests {
         // декодируется как картинка того же размера
         let img = image::load_from_memory(&jpg).unwrap();
         assert_eq!((img.width(), img.height()), (pm.width(), pm.height()));
+    }
+
+    /// Документ из одной широкой ячейки с текстом и форматом `fmt`.
+    fn single_cell_doc(text: &str, fmt: CellFormat, width_units: u32) -> Document {
+        Document {
+            formats: vec![
+                fmt,
+                CellFormat {
+                    width: Some(width_units),
+                    ..CellFormat::default()
+                },
+                CellFormat {
+                    height: Some(600),
+                    ..CellFormat::default()
+                },
+            ],
+            default_group: crate::mxl_parser::ColumnGroup {
+                columns: vec![(0, 2)],
+            },
+            rows: vec![Row {
+                index: 0,
+                format: 3,
+                cells: vec![(
+                    0,
+                    Cell {
+                        format: 1,
+                        text: Some(text.to_string()),
+                        value: None,
+                    },
+                )],
+            }],
+            ..Document::default()
+        }
+    }
+
+    /// Ограничивающий прямоугольник тёмных пикселей (x0, y0, x1, y1).
+    fn dark_bbox(pm: &Pixmap) -> (u32, u32, u32, u32) {
+        let w = pm.width();
+        let mut b = (u32::MAX, u32::MAX, 0, 0);
+        for (i, p) in pm.data().as_chunks::<4>().0.iter().enumerate() {
+            if p[0] < 128 {
+                let (x, y) = (i as u32 % w, i as u32 / w);
+                b = (b.0.min(x), b.1.min(y), b.2.max(x), b.3.max(y));
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn wrap_marks_paragraph_ends() {
+        let fonts = Fonts::load().unwrap();
+        let spec = FontSpec::default();
+        let lines = wrap_text_paragraphs(&fonts, &spec, 1.0, "раз два три четыре\nпять", 60.0);
+        let ends: Vec<bool> = lines.iter().map(|(_, e)| *e).collect();
+        assert!(lines.len() >= 3, "{lines:?}");
+        assert_eq!(ends.last(), Some(&true));
+        assert!(!ends[0], "первая строка переноса — не конец абзаца");
+        assert_eq!(ends.iter().filter(|e| **e).count(), 2, "два абзаца");
+    }
+
+    #[test]
+    fn justified_text_reaches_right_edge() {
+        let text = "Текст по ширине растягивается до правого края ячейки за счёт пробелов";
+        let fmt = |h_align| CellFormat {
+            h_align: Some(h_align),
+            v_align: Some(0),
+            text_control: Some(3),
+            ..CellFormat::default()
+        };
+        let render_first_line = |h_align| {
+            let doc = single_cell_doc(text, fmt(h_align), 200);
+            let pm = render(&doc, 100).unwrap();
+            // первая строка текста — верхние 12 px ячейки
+            let mut first = Pixmap::new(pm.width(), 14).unwrap();
+            copy_pixmap(&mut first, &pm, 0, 0);
+            let w = pm.width() as usize;
+            first.data_mut().copy_from_slice(&pm.data()[..w * 14 * 4]);
+            (dark_bbox(&first), pm.width())
+        };
+        let ((_, _, left_x1, _), width) = render_first_line(0);
+        let ((_, _, just_x1, _), _) = render_first_line(4);
+        assert!(
+            just_x1 > left_x1 + 5,
+            "по ширине {just_x1} vs влево {left_x1}"
+        );
+        assert!(
+            just_x1 + 8 >= width - 2,
+            "строка доходит до края: {just_x1} из {width}"
+        );
+    }
+
+    #[test]
+    fn rotated_text_angles() {
+        let fmt = |tenths| CellFormat {
+            orientation: Some(tenths),
+            ..CellFormat::default()
+        };
+        let bbox = |tenths| {
+            let pm = render(&single_cell_doc("Повёрнутый текст", fmt(tenths), 160), 100).unwrap();
+            let (x0, y0, x1, y1) = dark_bbox(&pm);
+            (x1 - x0, y1 - y0)
+        };
+        let (w0, h0) = bbox(0);
+        let (w180, h180) = bbox(1800);
+        assert!(
+            w180.abs_diff(w0) <= 3 && h180.abs_diff(h0) <= 3,
+            "180°: {w180}x{h180} vs {w0}x{h0}"
+        );
+        let (w270, h270) = bbox(2700);
+        assert!(h270 > w270 * 3, "270° — вертикально: {w270}x{h270}");
+        let (w45, h45) = bbox(450);
+        assert!(w45.abs_diff(h45) < w45 / 3, "45° — диагональ: {w45}x{h45}");
+        if std::env::var_os("SPREADSHEET_DUMP").is_some() {
+            for t in [0, 450, 1800, 2700] {
+                render(&single_cell_doc("Повёрнутый текст", fmt(t), 160), 100)
+                    .unwrap()
+                    .save_png(out_dir().join(format!("angle_{t}.png")))
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn cell_values_are_formatted() {
+        let doc = generated("ЗначенияЯчеек_ЧислаДаты.mxl");
+        let texts: Vec<String> = doc
+            .rows
+            .iter()
+            .flat_map(|r| r.cells.iter())
+            .filter(|(_, c)| c.value.is_some())
+            .map(|(_, c)| c.text.clone().unwrap().replace('\u{a0}', " "))
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "1 234 567,89",
+                "1 234 567,89",
+                "98 765,43",
+                "98 765,43",
+                "19.07.2026",
+                "19.07.2026"
+            ]
+        );
+        assert_eq!(doc.number_formats, ["ЧДЦ=2; ЧРД=,", "ДФ=dd.MM.yyyy"]);
     }
 }

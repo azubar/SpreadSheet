@@ -183,3 +183,13 @@ fn print_sheets_match_golden_images() {
     }
     assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
+
+/// Ячейки со значением (число, дата) и форматной строкой —
+/// `generated/ЗначенияЯчеек_ЧислаДаты.mxl`.
+#[test]
+fn cell_values_match_golden_image() {
+    let path = root().join("mxl-demo-collection/generated/ЗначенияЯчеек_ЧислаДаты.mxl");
+    let doc = parse_file(&path).unwrap();
+    let pixmap = render(&doc, SCALE).unwrap();
+    check(&stem(&path), &pixmap).unwrap();
+}

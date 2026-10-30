@@ -166,6 +166,50 @@ def long_table(root, extra_rows: int):
     return root
 
 
+def typed_values(root):
+    """Ячейки с текстом числа/даты → ячейки со значением {"N"|"D", …}.
+
+    В «ДемонстрацияВозможностейТабличногоДокумента.mxl» ячейки с форматами
+    «ЧДЦ=2; ЧРД=,» и «ДФ=dd.MM.yyyy» заполнены текстом; здесь они получают
+    значение (маркер 2 вместо 16) — как в печатных формах, где параметр
+    макета заполняется числом или датой.
+    """
+    root = copy.deepcopy(root)
+    replacements = {
+        "1234567,89": ["N", "1234567.891"],
+        "98765,43 ₽": ["N", "98765.43"],
+        "19.07.2026": ["D", "20260719000000"],
+    }
+    replaced = 0
+
+    def visit(value):
+        nonlocal replaced
+        if not isinstance(value, list):
+            return
+        # ячейка {16, формат, {1, 1, {"#", текст}}, 0}
+        if (
+            len(value) >= 3
+            and value[0] == 16
+            and isinstance(value[2], list)
+            and len(value[2]) == 3
+            and isinstance(value[2][2], list)
+            and len(value[2][2]) == 2
+            and value[2][2][1] in replacements
+        ):
+            kind, raw = replacements[value[2][2][1]]
+            value[0] = 2
+            value[2] = [Str(kind), raw]  # число/дата — атом без кавычек
+            replaced += 1
+            return
+        for item in value:
+            visit(item)
+
+    visit(root)
+    if replaced < len(replacements):
+        raise ValueError(f"заменено {replaced} ячеек из {len(replacements)}")
+    return root
+
+
 def main() -> int:
     OUTPUT.mkdir(exist_ok=True)
     header, root = load(SOURCE)
@@ -189,6 +233,10 @@ def main() -> int:
 
     save(OUTPUT / "ДлиннаяТаблица_БезРазрывов.mxl", header, long_table(root, 300))
     print("[OK] ДлиннаяТаблица_БезРазрывов.mxl")
+
+    features_header, features = load(ROOT / "ДемонстрацияВозможностейТабличногоДокумента.mxl")
+    save(OUTPUT / "ЗначенияЯчеек_ЧислаДаты.mxl", features_header, typed_values(features))
+    print("[OK] ЗначенияЯчеек_ЧислаДаты.mxl")
 
     # контроль: сериализация без изменений восстанавливает файл по смыслу
     if parse(serialize(root)) != root:

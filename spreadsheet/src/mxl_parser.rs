@@ -28,6 +28,8 @@
 use std::fmt;
 use std::path::Path;
 
+use crate::format1c::{format_value, parse_date, CellValue};
+
 // ---------------------------------------------------------------------------
 // Ошибки
 // ---------------------------------------------------------------------------
@@ -208,6 +210,9 @@ pub struct CellFormat {
     pub text_control: Option<u32>,
     /// Ориентация текста в десятых долях градуса (900 = вертикально, 90°)
     pub orientation: Option<u32>,
+    /// Форматная строка значения — индекс в таблице числовых форматов
+    /// документа (`Document::number_formats`, 0-базный)
+    pub number_format: Option<u32>,
 }
 
 /// Семейство шрифта для рендера: имя шрифта из документа сводится к одному
@@ -310,11 +315,15 @@ pub enum ColorSpec {
     Auto,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Cell {
     /// Индекс формата, 1-базный; 0 = формата нет
     pub format: u32,
+    /// Текст ячейки; для ячейки со значением — представление значения по
+    /// форматной строке (заполняется после разбора всего документа)
     pub text: Option<String>,
+    /// Значение ячейки («Содержит значение»): число, дата, булево, строка
+    pub value: Option<CellValue>,
 }
 
 #[derive(Debug, Clone)]
@@ -551,6 +560,9 @@ pub struct Document {
     pub print_area: Option<PrintArea>,
     /// Параметры печати (значения по умолчанию, если записи нет)
     pub page_setup: PageSetup,
+    /// Таблица форматных строк значений (`ЧДЦ=2`, `ДФ=dd.MM.yyyy`…);
+    /// индексы из форматов 0-базные
+    pub number_formats: Vec<String>,
     pub rows: Vec<Row>,
     /// Таблица форматов; индексы из ячеек 1-базные: ячейка с format = i
     /// ссылается на formats[i-1]
@@ -691,13 +703,17 @@ fn cell_from_value(fields: &[Value]) -> Option<Cell> {
     let marker = fields[0].as_num()?;
     let format = fields[1].as_num().unwrap_or(0).max(0) as u32;
     let mut text = None;
-    // после формата: [ссылка если маркер&4], [текст если маркер&16]
+    let mut value = None;
+    // после формата: [значение если маркер&2], [ссылка если маркер&4],
+    // [текст если маркер&16]
     let mut next = 2usize;
     if marker & 2 != 0 {
-        // типизированное значение: {"S", "текст"}
+        // типизированное значение {тип, значение}: "S" — строка, "N" —
+        // число, "D" — дата ГГГГММДДччммсс, "B" — булево
         if let Some(tv) = fields.get(next).and_then(Value::as_list) {
-            if tv.len() >= 2 && tv[0].as_str() == Some("S") {
-                text = tv[1].as_str().map(str::to_string);
+            value = typed_value(tv);
+            if let Some(CellValue::Str(s)) = &value {
+                text = Some(s.clone());
             }
             next += 1;
         }
@@ -717,7 +733,65 @@ fn cell_from_value(fields: &[Value]) -> Option<Cell> {
             }
         }
     }
-    Some(Cell { format, text })
+    Some(Cell {
+        format,
+        text,
+        value,
+    })
+}
+
+/// Текстовое представление числа или атома (`123`, `-1234.5`).
+fn scalar_text(v: &Value) -> Option<String> {
+    match v {
+        Value::Num(n) => Some(n.to_string()),
+        Value::Atom(a) => Some(a.clone()),
+        Value::Str(s) => Some(s.clone()),
+        Value::List(_) => None,
+    }
+}
+
+/// Типизированное значение `{тип, значение}`.
+fn typed_value(tv: &[Value]) -> Option<CellValue> {
+    let kind = tv.first()?.as_str()?;
+    let raw = tv.get(1);
+    match kind {
+        "S" => raw?.as_str().map(|s| CellValue::Str(s.to_string())),
+        "N" => scalar_text(raw?).map(CellValue::Number),
+        "D" => parse_date(&scalar_text(raw?)?).map(CellValue::Date),
+        "B" => Some(CellValue::Bool(raw?.as_num()? != 0)),
+        _ => None,
+    }
+}
+
+/// Таблица форматных строк значений: `N, {1, 1, {язык, строка}} × N` —
+/// сразу после таблицы шрифтов.
+fn number_formats_from(root: &[Value], start: usize) -> Vec<String> {
+    let Some(n) = root.get(start).and_then(Value::as_num) else {
+        return Vec::new();
+    };
+    if !(1..=10_000).contains(&n) {
+        return Vec::new();
+    }
+    let entries: Vec<String> = root
+        .iter()
+        .skip(start + 1)
+        .take(n as usize)
+        .map_while(|v| first_string(v).map(str::to_string))
+        .collect();
+    if entries.len() == n as usize {
+        entries
+    } else {
+        Vec::new()
+    }
+}
+
+/// Первая строка (не код языка «#») внутри вложенного объекта.
+fn first_string(v: &Value) -> Option<&str> {
+    match v {
+        Value::Str(s) if s != "#" => Some(s),
+        Value::List(items) => items.iter().find_map(first_string),
+        _ => None,
+    }
 }
 
 /// Строгий разбор блока строк начиная с поля `start`.
@@ -764,6 +838,7 @@ fn parse_rows(root: &[Value], start: usize) -> Result<(Vec<Row>, usize), MxlErro
             let cell = cell_from_value(cell_fields).unwrap_or(Cell {
                 format: 0,
                 text: None,
+                value: None,
             });
             cells.push((col as u32, cell));
             i += 2;
@@ -838,6 +913,7 @@ fn format_from_value(fields: &[Value]) -> CellFormat {
             13 => fmt.pattern_color = Some(v),
             14 => fmt.text_control = Some(v),
             18 => fmt.orientation = Some(v),
+            24 => fmt.number_format = Some(v),
             _ => {}
         }
     }
@@ -1357,6 +1433,7 @@ fn parse_tail(root: &[Value], rows_end: usize, doc: &mut Document) {
     if let Some((formats, fonts, fonts_end)) = find_format_and_font_tables(root, i) {
         doc.formats = formats;
         doc.fonts = fonts;
+        doc.number_formats = number_formats_from(root, fonts_end);
         // таблица цветов идёт после таблицы шрифтов (через таблицу числовых
         // форматов и пару служебных полей)
         if let Some((colors, colors_end)) = find_color_table(root, fonts_end) {
@@ -1401,6 +1478,33 @@ pub fn parse_file(path: &Path) -> Result<Document, MxlError> {
     parse_bytes(&data)
 }
 
+/// Текст ячеек со значением: представление значения по форматной строке
+/// формата ячейки (или строки).
+pub fn fill_value_texts(doc: &mut Document) {
+    let formats = &doc.formats;
+    let format_of = |index: u32| -> Option<u32> {
+        if index == 0 {
+            return None;
+        }
+        formats.get(index as usize - 1)?.number_format
+    };
+    for row in &mut doc.rows {
+        let row_format = format_of(row.format);
+        for (_, cell) in &mut row.cells {
+            if cell.text.is_some() {
+                continue;
+            }
+            let Some(value) = &cell.value else { continue };
+            let pattern = format_of(cell.format)
+                .or(row_format)
+                .and_then(|i| doc.number_formats.get(i as usize))
+                .map(String::as_str)
+                .unwrap_or("");
+            cell.text = Some(format_value(value, pattern));
+        }
+    }
+}
+
 /// Разбирает содержимое файла *.mxl.
 pub fn parse_bytes(data: &[u8]) -> Result<Document, MxlError> {
     let body = check_header(data)?;
@@ -1435,6 +1539,7 @@ pub fn parse_bytes(data: &[u8]) -> Result<Document, MxlError> {
         ..Document::default()
     };
     parse_tail(root, rows_end, &mut doc);
+    fill_value_texts(&mut doc);
     Ok(doc)
 }
 

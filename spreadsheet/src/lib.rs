@@ -16,6 +16,7 @@
 //! ДвоичныеДанные), а текст ошибки доступен в свойстве `ОписаниеОшибки`.
 
 pub mod converter;
+pub mod format1c;
 pub mod mxl_parser;
 pub mod pdf_renderer;
 
