@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use spreadsheet::converter::{render, render_page};
+use spreadsheet::converter::{render, render_page, PrintJob};
 use spreadsheet::mxl_parser::parse_file;
 
 const SCALE: u32 = 50;
@@ -152,4 +152,34 @@ fn long_generated_table_renders() {
     assert!(doc.row_breaks().is_empty());
     let pixmap = render(&doc, SCALE).unwrap();
     assert!(pixmap.height() > 5_000, "{}", pixmap.height());
+}
+
+/// Листы режима «как при печати» (50 DPI): A4 книжная с ч/б печатью и A5.
+#[test]
+fn print_sheets_match_golden_images() {
+    let cases = [
+        (
+            "mxl-demo-collection/ДемонстрацияПечатиРазрывов_A4_Книжная.mxl",
+            1,
+        ),
+        (
+            "mxl-demo-collection/ДемонстрацияПечатиРазрывов_A4_Книжная.mxl",
+            2,
+        ),
+        ("mxl-demo-collection/generated/Печать_A5_Книжная.mxl", 2),
+        (
+            "mxl-demo-collection/generated/Печать_A4_Альбомная_50.mxl",
+            1,
+        ),
+    ];
+    let mut errors = Vec::new();
+    for (path, page) in cases {
+        let path = root().join(path);
+        let doc = parse_file(&path).unwrap();
+        let sheet = PrintJob::new(&doc, 50).unwrap().render(&doc, page).unwrap();
+        if let Err(e) = check(&format!("печать_{}_лист{page}", stem(&path)), &sheet) {
+            errors.push(e);
+        }
+    }
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
 }

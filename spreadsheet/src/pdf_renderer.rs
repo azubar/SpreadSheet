@@ -40,7 +40,7 @@ const PDF_SIZE_HINT: &str =
 /// Итоговое разрешение растеризации: «РазрешениеPDF» × «Масштаб». Масштаб
 /// применяется без ограничений — размер результата контролируется пределами
 /// картинки (см. [`check_stacked_size`]), которые проверяются до рендера.
-fn effective_dpi(base_dpi: u32, scale: u32) -> f32 {
+pub(crate) fn effective_dpi(base_dpi: u32, scale: u32) -> f32 {
     base_dpi as f32 * scale as f32 / 100.0
 }
 
@@ -68,7 +68,7 @@ fn validate_pdf_bytes(bytes: &[u8]) -> Result<(), String> {
 /// Проверяет размер картинки из страниц `sizes` (ширина, высота в px),
 /// склеенных вертикально с интервалом `spacing`. Вызывается до выделения
 /// памяти: на Windows — до рендера страниц, на Linux — по оценке `pdfinfo`.
-fn check_stacked_size(sizes: &[(u64, u64)], spacing: u32) -> Result<(), String> {
+pub(crate) fn check_stacked_size(sizes: &[(u64, u64)], spacing: u32) -> Result<(), String> {
     let max_w = sizes.iter().map(|s| s.0).max().unwrap_or(0);
     let total_h = sizes.iter().map(|s| s.1).sum::<u64>()
         + spacing as u64 * sizes.len().saturating_sub(1) as u64;
@@ -76,7 +76,10 @@ fn check_stacked_size(sizes: &[(u64, u64)], spacing: u32) -> Result<(), String> 
 }
 
 /// Склеивает страницы вертикально (по центру по горизонтали) на белом фоне.
-fn stack_pages(pages: &[tiny_skia::Pixmap], spacing: u32) -> Result<tiny_skia::Pixmap, String> {
+pub(crate) fn stack_pages(
+    pages: &[tiny_skia::Pixmap],
+    spacing: u32,
+) -> Result<tiny_skia::Pixmap, String> {
     if pages.is_empty() {
         return Err("PDF-документ не содержит страниц".to_string());
     }

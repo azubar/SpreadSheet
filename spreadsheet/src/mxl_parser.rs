@@ -385,6 +385,162 @@ pub struct PrintArea {
     pub bottom: Option<u32>,
 }
 
+/// Параметры печати документа (запись `{{0, N, (ключ, {тип, значение}) × N}}`,
+/// см. docs/format-mxl.md, §5.1). Поля, не заданные в файле, — значения 1С
+/// по умолчанию.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageSetup {
+    /// Имя формата листа (`РазмерСтраницы`): "A4", "A3", "Letter"…;
+    /// `None` — не задано (1С берёт A4 или настройки принтера)
+    pub paper: Option<String>,
+    /// Размер листа в мм из файла (ключи 16/17) — для пользовательского
+    /// формата; у стандартных форматов размер берётся из имени
+    pub custom_size_mm: Option<(f64, f64)>,
+    /// Альбомная ориентация
+    pub landscape: bool,
+    /// Масштаб печати, %
+    pub scale: u32,
+    /// Автомасштаб: вписать по ширине страницы
+    pub auto_scale: bool,
+    /// Поля сверху, слева, снизу, справа, мм
+    pub margins_mm: [f64; 4],
+    /// Высота колонтитулов сверху и снизу, мм
+    pub header_footer_mm: [f64; 2],
+    /// Чёрно-белая печать
+    pub black_and_white: bool,
+}
+
+impl Default for PageSetup {
+    fn default() -> Self {
+        PageSetup {
+            paper: None,
+            custom_size_mm: None,
+            landscape: false,
+            scale: 100,
+            auto_scale: false,
+            margins_mm: [10.0; 4],
+            header_footer_mm: [10.0; 2],
+            black_and_white: false,
+        }
+    }
+}
+
+/// Стандартные форматы листа, мм (книжная ориентация).
+const PAPER_SIZES_MM: [(&str, f64, f64); 12] = [
+    ("A3", 297.0, 420.0),
+    ("A4", 210.0, 297.0),
+    ("A5", 148.0, 210.0),
+    ("A6", 105.0, 148.0),
+    ("B4", 250.0, 353.0),
+    ("B5", 176.0, 250.0),
+    ("Letter", 215.9, 279.4),
+    ("Legal", 215.9, 355.6),
+    ("Executive", 184.15, 266.7),
+    ("Tabloid", 279.4, 431.8),
+    ("Ledger", 431.8, 279.4),
+    ("Statement", 139.7, 215.9),
+];
+
+impl PageSetup {
+    /// Размер листа с учётом ориентации, мм (ширина, высота). Неизвестный
+    /// формат без размера в файле — A4.
+    pub fn paper_size_mm(&self) -> (f64, f64) {
+        let named = self.paper.as_deref().and_then(|name| {
+            let name = name.trim();
+            PAPER_SIZES_MM
+                .iter()
+                .find(|(n, _, _)| n.eq_ignore_ascii_case(name))
+                .map(|&(_, w, h)| (w, h))
+        });
+        let (w, h) = named.or(self.custom_size_mm).unwrap_or((210.0, 297.0));
+        if self.landscape {
+            (w.max(h), w.min(h))
+        } else {
+            (w.min(h), w.max(h))
+        }
+    }
+
+    /// Ширина и высота области печати (лист минус поля), мм.
+    pub fn printable_mm(&self) -> (f64, f64) {
+        let (w, h) = self.paper_size_mm();
+        let [top, left, bottom, right] = self.margins_mm;
+        ((w - left - right).max(10.0), (h - top - bottom).max(10.0))
+    }
+}
+
+/// Числовое значение `{"N", число}` (целое или дробное).
+fn typed_number(v: &Value) -> Option<f64> {
+    let fields = v.as_list()?;
+    if fields.first()?.as_str()? != "N" {
+        return None;
+    }
+    match fields.get(1)? {
+        Value::Num(n) => Some(*n as f64),
+        Value::Atom(a) => a.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Разбирает запись параметров печати `{{0, N, (ключ, значение) × N}}`.
+fn page_setup_from_value(v: &Value) -> Option<PageSetup> {
+    let outer = v.as_list()?;
+    if outer.len() != 1 {
+        return None;
+    }
+    let rec = outer[0].as_list()?;
+    if rec.len() < 2 || rec[0].as_num()? != 0 {
+        return None;
+    }
+    let count = rec[1].as_num()?;
+    let pairs = &rec[2..];
+    if count < 1 || pairs.len() != 2 * count as usize {
+        return None;
+    }
+    let mut setup = PageSetup::default();
+    let mut size = (None, None);
+    for pair in pairs.chunks(2) {
+        let key = pair[0].as_num()?;
+        let value = &pair[1];
+        // значение — объект {тип, значение}
+        value.as_list()?;
+        let num = typed_number(value);
+        match key {
+            0 => {
+                setup.paper = value
+                    .as_list()
+                    .and_then(|f| f.get(1))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }
+            1 => setup.landscape = num == Some(2.0),
+            2 => {
+                if let Some(n) = num.filter(|n| (1.0..=1000.0).contains(n)) {
+                    setup.scale = n.round() as u32;
+                }
+            }
+            6..=9 => {
+                if let Some(n) = num.filter(|n| *n >= 0.0) {
+                    setup.margins_mm[(key - 6) as usize] = n / 100.0;
+                }
+            }
+            10 | 11 => {
+                if let Some(n) = num.filter(|n| *n >= 0.0) {
+                    setup.header_footer_mm[(key - 10) as usize] = n / 100.0;
+                }
+            }
+            12 => setup.auto_scale = num.is_some_and(|n| n != 0.0),
+            13 => setup.black_and_white = num.is_some_and(|n| n != 0.0),
+            16 => size.0 = num.filter(|n| *n > 0.0),
+            17 => size.1 = num.filter(|n| *n > 0.0),
+            _ => {}
+        }
+    }
+    if let (Some(w), Some(h)) = size {
+        setup.custom_size_mm = Some((w, h));
+    }
+    Some(setup)
+}
+
 /// Признак разрыва страницы в формате строки/колонки (значение поля
 /// «другого измерения»: ширины для строки, высоты для колонки).
 const PAGE_BREAK_FLAG: u32 = 4;
@@ -393,6 +549,8 @@ const PAGE_BREAK_FLAG: u32 = 4;
 pub struct Document {
     /// Область печати документа
     pub print_area: Option<PrintArea>,
+    /// Параметры печати (значения по умолчанию, если записи нет)
+    pub page_setup: PageSetup,
     pub rows: Vec<Row>,
     /// Таблица форматов; индексы из ячеек 1-базные: ячейка с format = i
     /// ссылается на formats[i-1]
@@ -1186,6 +1344,10 @@ fn parse_tail(root: &[Value], rows_end: usize, doc: &mut Document) {
             break;
         }
     }
+    // параметры печати: запись {{0, N, ключ, значение…}} в хвосте
+    if let Some(setup) = root.iter().skip(i).find_map(page_setup_from_value) {
+        doc.page_setup = setup;
+    }
     // область печати: первый объект вида {тип, л, в, п, н, GUID} в хвосте
     doc.print_area = root
         .iter()
@@ -1605,5 +1767,46 @@ mod tests {
         assert_eq!(area([3, 5, 0, 2, 0]), Some(None), "перевёрнутая область");
         assert_eq!(area([9, 0, 0, 1, 1]), None, "неизвестный тип");
         assert_eq!(print_area_from_value(&Value::Num(3)), None);
+    }
+
+    #[test]
+    fn parses_page_setup_of_printing_demos() {
+        let a4 = parse_file(&demo("ДемонстрацияПечатиРазрывов_A4_Книжная.mxl")).unwrap();
+        let s = &a4.page_setup;
+        assert_eq!(s.paper.as_deref(), Some("A4"));
+        assert!(!s.landscape && !s.auto_scale && s.black_and_white);
+        assert_eq!(s.scale, 85);
+        assert_eq!(s.margins_mm, [10.0, 12.0, 10.0, 12.0]);
+        assert_eq!(s.paper_size_mm(), (210.0, 297.0));
+        assert_eq!(s.printable_mm(), (186.0, 277.0));
+
+        let landscape = parse_file(&demo("ДемонстрацияПечатиРазрывов_A4_Альбомная.mxl")).unwrap();
+        assert!(landscape.page_setup.landscape);
+        assert_eq!(landscape.page_setup.paper_size_mm(), (297.0, 210.0));
+
+        // у A3 в ключах 16/17 записано 210×297, размер берётся из имени
+        let a3 = parse_file(&demo("ДемонстрацияПечатиРазрывов_A3_Книжная.mxl")).unwrap();
+        assert_eq!(a3.page_setup.custom_size_mm, Some((210.0, 297.0)));
+        assert_eq!(a3.page_setup.paper_size_mm(), (297.0, 420.0));
+    }
+
+    #[test]
+    fn page_setup_defaults_and_unknown_paper() {
+        let doc = parse_file(&demo("ДемонстрацияГраницОбъединений.mxl")).unwrap();
+        assert_eq!(doc.page_setup.paper, None);
+        assert_eq!(doc.page_setup.scale, 100);
+        assert_eq!(doc.page_setup.paper_size_mm(), (210.0, 297.0));
+        let custom = PageSetup {
+            paper: Some("Нестандартный".into()),
+            custom_size_mm: Some((100.0, 150.0)),
+            landscape: true,
+            ..PageSetup::default()
+        };
+        assert_eq!(custom.paper_size_mm(), (150.0, 100.0));
+        let letter = PageSetup {
+            paper: Some("letter".into()),
+            ..PageSetup::default()
+        };
+        assert_eq!(letter.paper_size_mm(), (215.9, 279.4));
     }
 }

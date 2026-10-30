@@ -166,6 +166,7 @@ pub fn convert(
 // Раскладка
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct Layout {
     /// x-границы колонок для каждой строки не нужны целиком: группы колонок
     /// различаются по строкам, поэтому храним x-границы по группам, а для
@@ -904,13 +905,8 @@ fn table_size(doc: &Document) -> (u32, u32) {
 /// страниц. Порядок страниц — «сначала вниз, затем вправо». Автоматическое
 /// разбиение по размеру листа бумаги не выполняется.
 pub fn pages(doc: &Document) -> Vec<PageRange> {
-    let (nrows, ncols) = table_size(doc);
-    let area = doc.print_area.unwrap_or_default();
     // граница области за пределами таблицы ограничивается таблицей
-    let top = area.top.unwrap_or(0).min(nrows - 1);
-    let bottom = area.bottom.unwrap_or(nrows - 1).min(nrows - 1).max(top);
-    let left = area.left.unwrap_or(0).min(ncols - 1);
-    let right = area.right.unwrap_or(ncols - 1).min(ncols - 1).max(left);
+    let (top, bottom, left, right) = print_area_bounds(doc);
     let row_parts = split_by_breaks(top, bottom, &doc.row_breaks());
     let col_parts = split_by_breaks(left, right, &doc.column_breaks());
     col_parts
@@ -938,16 +934,36 @@ pub fn render_page(doc: &Document, scale_percent: u32, page_number: u32) -> Resu
     let scale = scale_percent as f32 / 100.0;
     let fonts = Fonts::load()?;
     let prep = Prepared::new(doc)?;
-    let mut layout = build_layout(doc, &fonts, &prep, scale)?;
+    let layout = build_layout(doc, &fonts, &prep, scale)?;
+    let last_col = all.iter().map(|p| p.cols.1).max().unwrap_or(0);
+    let (left, top, right, bottom) = page_window(&layout, page, last_col);
     // поле 1 px слева/сверху и 2 px справа/снизу под рамки — как у всего
     // документа
-    // Границы колонок у разных групп различаются: страница охватывает
-    // колонки страницы во всех группах. Последняя по горизонтали страница
-    // ограничивается занятой содержимым шириной — как картинка всего
-    // документа (у группы по умолчанию колонки, заданные только в других
-    // группах, имеют ширину по умолчанию, и без этого справа оставалось бы
-    // пустое поле или, наоборот, обрезалось содержимое широких групп).
-    let last_col = all.iter().map(|p| p.cols.1).max().unwrap_or(0);
+    let (w, h) = (
+        (right - left + 3.0).ceil().max(1.0),
+        (bottom - top + 3.0).ceil().max(1.0),
+    );
+    check_image_size(w as u64, h as u64, "уменьшите Масштаб")?;
+    draw_window(
+        doc,
+        &fonts,
+        &prep,
+        &layout,
+        (left - 1.0, top - 1.0),
+        (w as u32, h as u32),
+    )
+}
+
+/// Прямоугольник страницы в координатах раскладки (без полей под рамки):
+/// (лево, верх, право, низ).
+///
+/// Границы колонок у разных групп различаются: страница охватывает колонки
+/// страницы во всех группах. Последняя по горизонтали страница
+/// ограничивается занятой содержимым шириной — как картинка всего
+/// документа (у группы по умолчанию колонки, заданные только в других
+/// группах, имеют ширину по умолчанию, и без этого справа оставалось бы
+/// пустое поле или, наоборот, обрезалось содержимое широких групп).
+fn page_window(layout: &Layout, page: &PageRange, last_col: u32) -> (f32, f32, f32, f32) {
     let left = layout
         .group_x
         .iter()
@@ -961,23 +977,267 @@ pub fn render_page(doc: &Document, scale_percent: u32, page_number: u32) -> Resu
     if page.cols.1 == last_col {
         right = right.min(layout.content_right).max(left);
     }
-    let x0 = left - 1.0;
-    let x1 = right + 2.0;
-    let y0 = layout.row_y[page.rows.0 as usize] - 1.0;
-    let y1 = layout.row_y[page.rows.1 as usize + 1] + 2.0;
-    let (w, h) = ((x1 - x0).ceil().max(1.0), (y1 - y0).ceil().max(1.0));
-    check_image_size(w as u64, h as u64, "уменьшите Масштаб")?;
-    for xs in &mut layout.group_x {
+    let top = layout.row_y[page.rows.0 as usize];
+    let bottom = layout.row_y[page.rows.1 as usize + 1];
+    (left, top, right, bottom)
+}
+
+/// Рисует окно раскладки с левым верхним углом `origin` размером `size`.
+/// Память — только под окно; содержимое за его границами отсекается.
+fn draw_window(
+    doc: &Document,
+    fonts: &Fonts,
+    prep: &Prepared,
+    layout: &Layout,
+    origin: (f32, f32),
+    size: (u32, u32),
+) -> Result<Pixmap, String> {
+    let mut window = layout.clone();
+    for xs in &mut window.group_x {
         for x in xs.iter_mut() {
-            *x -= x0;
+            *x -= origin.0;
         }
     }
-    for y in &mut layout.row_y {
-        *y -= y0;
+    for y in &mut window.row_y {
+        *y -= origin.1;
     }
-    layout.width_px = w as u32;
-    layout.height_px = h as u32;
-    draw_layout(doc, &fonts, &prep, &layout)
+    window.content_right -= origin.0;
+    window.width_px = size.0;
+    window.height_px = size.1;
+    draw_layout(doc, fonts, prep, &window)
+}
+
+// ---------------------------------------------------------------------------
+// Печать «как на бумаге»
+// ---------------------------------------------------------------------------
+
+/// Границы области печати (верх, низ, лево, право), ограниченные таблицей.
+fn print_area_bounds(doc: &Document) -> (u32, u32, u32, u32) {
+    let (nrows, ncols) = table_size(doc);
+    let area = doc.print_area.unwrap_or_default();
+    let top = area.top.unwrap_or(0).min(nrows - 1);
+    let bottom = area.bottom.unwrap_or(nrows - 1).min(nrows - 1).max(top);
+    let left = area.left.unwrap_or(0).min(ncols - 1);
+    let right = area.right.unwrap_or(ncols - 1).min(ncols - 1).max(left);
+    (top, bottom, left, right)
+}
+
+/// Делит элементы `[from, to]` (строки или колонки с границами `bounds`:
+/// элемент `i` занимает `bounds[i]..bounds[i + 1]`) на страницы длиной не
+/// больше `limit`, с принудительными разрывами после элементов `breaks`.
+/// Элемент длиннее страницы занимает отдельную страницу целиком.
+fn paginate(bounds: &[f32], from: u32, to: u32, limit: f32, breaks: &[u32]) -> Vec<(u32, u32)> {
+    let mut parts = Vec::new();
+    let mut start = from;
+    for i in from..=to {
+        if i > start && bounds[i as usize + 1] - bounds[start as usize] > limit {
+            parts.push((start, i - 1));
+            start = i;
+        }
+        if i < to && breaks.binary_search(&i).is_ok() {
+            parts.push((start, i));
+            start = i + 1;
+        }
+    }
+    if start <= to {
+        parts.push((start, to));
+    }
+    parts
+}
+
+/// Миллиметры → пиксели при разрешении `dpi`.
+fn mm_to_px(mm: f64, dpi: u32) -> f32 {
+    (mm / 25.4 * dpi as f64) as f32
+}
+
+/// Задание печати документа «как на бумаге»: раскладка в масштабе печати,
+/// страницы и геометрия листа. Каждая страница выводится картинкой листа
+/// (формат, ориентация, поля — из параметров печати документа) при
+/// разрешении `dpi`.
+///
+/// Масштаб: «МасштабПечати» документа, а при «Автомасштаб» — вписывание
+/// области печати по ширине листа (только уменьшение). Страницы: область
+/// печати, разделённая явными разрывами и по размеру листа; порядок —
+/// «сначала вниз, затем вправо». Колонтитулы и повтор строк при печати не
+/// выводятся (их хранение в MXL пока не разобрано).
+pub struct PrintJob {
+    fonts: Fonts<'static>,
+    prep: Prepared,
+    layout: Layout,
+    pages: Vec<PageRange>,
+    last_col: u32,
+    paper_px: (u32, u32),
+    origin_px: (f32, f32),
+    printable_px: (f32, f32),
+    grayscale: bool,
+    scale: f32,
+}
+
+impl PrintJob {
+    pub fn new(doc: &Document, dpi: u32) -> Result<PrintJob, String> {
+        let setup = &doc.page_setup;
+        let fonts = Fonts::load()?;
+        let prep = Prepared::new(doc)?;
+        let (paper_w, paper_h) = setup.paper_size_mm();
+        let (avail_w, avail_h) = setup.printable_mm();
+        let paper_px = (
+            mm_to_px(paper_w, dpi).round().max(1.0) as u32,
+            mm_to_px(paper_h, dpi).round().max(1.0) as u32,
+        );
+        check_image_size(
+            paper_px.0 as u64,
+            paper_px.1 as u64,
+            "уменьшите РазрешениеПечати",
+        )?;
+        let (top, bottom, left, right) = print_area_bounds(doc);
+
+        let mut print_scale = setup.scale as f32 / 100.0;
+        if setup.auto_scale {
+            // ширина области печати при 100% (px при 96 DPI)
+            let base = build_layout(doc, &fonts, &prep, 1.0)?;
+            let (x0, _, x1, _) = page_window(
+                &base,
+                &PageRange {
+                    rows: (top, bottom),
+                    cols: (left, right),
+                },
+                right,
+            );
+            let width = (x1 - x0).max(1.0);
+            print_scale = (mm_to_px(avail_w, 96) / width).min(1.0);
+        }
+        let scale = print_scale * dpi as f32 / 96.0;
+        let layout = build_layout(doc, &fonts, &prep, scale)?;
+        let printable_px = (mm_to_px(avail_w, dpi), mm_to_px(avail_h, dpi));
+
+        // правая граница колонок: последняя колонка, начинающаяся левее
+        // занятой содержимым ширины (колонки-«хвосты» группы по умолчанию
+        // не дают пустых страниц справа)
+        let col_starts: Vec<f32> = (0..layout.group_x[0].len())
+            .map(|i| {
+                layout
+                    .group_x
+                    .iter()
+                    .map(|xs| xs[i])
+                    .fold(f32::INFINITY, f32::min)
+            })
+            .collect();
+        let right = (left..=right)
+            .rev()
+            .find(|&c| col_starts[c as usize] < layout.content_right)
+            .unwrap_or(left);
+        let col_bounds: Vec<f32> = (0..layout.group_x[0].len())
+            .map(|i| layout.group_x.iter().map(|xs| xs[i]).fold(0.0f32, f32::max))
+            .collect();
+        let row_parts = paginate(
+            &layout.row_y,
+            top,
+            bottom,
+            printable_px.1,
+            &doc.row_breaks(),
+        );
+        let col_parts = paginate(
+            &col_bounds,
+            left,
+            right,
+            printable_px.0,
+            &doc.column_breaks(),
+        );
+        let pages: Vec<PageRange> = col_parts
+            .iter()
+            .flat_map(|&cols| row_parts.iter().map(move |&rows| PageRange { rows, cols }))
+            .collect();
+        let [margin_top, margin_left, _, _] = setup.margins_mm;
+        Ok(PrintJob {
+            fonts,
+            prep,
+            pages,
+            last_col: right,
+            paper_px,
+            origin_px: (mm_to_px(margin_left, dpi), mm_to_px(margin_top, dpi)),
+            printable_px,
+            grayscale: setup.black_and_white,
+            scale: print_scale,
+            layout,
+        })
+    }
+
+    /// Число страниц.
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Размер листа, px.
+    pub fn paper_size_px(&self) -> (u32, u32) {
+        self.paper_px
+    }
+
+    /// Итоговый масштаб печати (1.0 = 100%): «МасштабПечати» или результат
+    /// автомасштаба.
+    pub fn print_scale(&self) -> f32 {
+        self.scale
+    }
+
+    /// Рендерит страницу `page_number` (с 1) картинкой листа.
+    pub fn render(&self, doc: &Document, page_number: u32) -> Result<Pixmap, String> {
+        let page = page_number
+            .checked_sub(1)
+            .and_then(|i| self.pages.get(i as usize))
+            .ok_or_else(|| {
+                format!(
+                    "запрошена страница {page_number}, но при печати в документе {} стр.",
+                    self.pages.len()
+                )
+            })?;
+        let (left, top, right, bottom) = page_window(&self.layout, page, self.last_col);
+        // содержимое шире или выше области печати (одна строка выше листа)
+        // обрезается по области печати
+        let right = right.min(left + self.printable_px.0);
+        let bottom = bottom.min(top + self.printable_px.1);
+        let size = (
+            (right - left + 3.0).ceil().max(1.0) as u32,
+            (bottom - top + 3.0).ceil().max(1.0) as u32,
+        );
+        let content = draw_window(
+            doc,
+            &self.fonts,
+            &self.prep,
+            &self.layout,
+            (left - 1.0, top - 1.0),
+            size,
+        )?;
+        let mut paper = white_pixmap(self.paper_px.0, self.paper_px.1)?;
+        copy_pixmap(
+            &mut paper,
+            &content,
+            (self.origin_px.0 - 1.0).round().max(0.0) as u32,
+            (self.origin_px.1 - 1.0).round().max(0.0) as u32,
+        );
+        if self.grayscale {
+            to_grayscale(&mut paper);
+        }
+        Ok(paper)
+    }
+}
+
+/// Переводит картинку в оттенки серого (яркость по ITU-R BT.601).
+pub fn to_grayscale(pixmap: &mut Pixmap) {
+    for p in pixmap.data_mut().as_chunks_mut::<4>().0.iter_mut() {
+        let y = (p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114 + 500) / 1000;
+        p[0] = y as u8;
+        p[1] = y as u8;
+        p[2] = y as u8;
+    }
+}
+
+/// Проверяет, что картинка в оттенках серого (R = G = B во всех пикселях).
+pub fn is_grayscale(pixmap: &Pixmap) -> bool {
+    pixmap
+        .data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .all(|p| p[0] == p[1] && p[1] == p[2])
 }
 
 /// Рисует документ по готовой раскладке в буфер размера раскладки.
@@ -1781,6 +2041,16 @@ fn megabytes(bytes: usize) -> String {
     format!("{:.1}", bytes as f64 / 1_000_000.0)
 }
 
+/// Сведения для заголовка файла картинки.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ImageMeta {
+    /// Разрешение (точек на дюйм) — чтобы картинка печаталась и
+    /// вставлялась в документы в натуральную величину
+    pub dpi: Option<f32>,
+    /// Картинка в оттенках серого: кодируется одним каналом (файл меньше)
+    pub grayscale: bool,
+}
+
 /// Кодирует растровый буфер в JPEG или PNG в памяти; результат больше
 /// `max_bytes` считается ошибкой.
 pub fn encode_to_vec(
@@ -1788,9 +2058,27 @@ pub fn encode_to_vec(
     kind: &ImageKind,
     max_bytes: usize,
 ) -> Result<Vec<u8>, String> {
+    encode_image(pixmap, kind, max_bytes, ImageMeta::default())
+}
+
+/// Как [`encode_to_vec`], с разрешением и признаком оттенков серого.
+pub fn encode_image(
+    pixmap: &Pixmap,
+    kind: &ImageKind,
+    max_bytes: usize,
+    meta: ImageMeta,
+) -> Result<Vec<u8>, String> {
     let (w, h) = (pixmap.width(), pixmap.height());
+    let pixels = w as usize * h as usize;
     // Pixmap хранит премультиплицированный RGBA; все этапы рендера дают
     // непрозрачные пиксели (альфа 255), для которых он совпадает с обычным.
+    let gray = if meta.grayscale {
+        let mut gray = try_buffer(pixels)?;
+        gray.extend(pixmap.data().as_chunks::<4>().0.iter().map(|p| p[0]));
+        Some(gray)
+    } else {
+        None
+    };
     let mut out = Vec::new();
     match kind {
         ImageKind::Jpeg { quality } => {
@@ -1801,32 +2089,66 @@ pub fn encode_to_vec(
             // меньше, но расплывается цветной текст и тонкие цветные рамки.
             let mut encoder = jpeg_encoder::Encoder::new(&mut out, *quality);
             encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
-            encoder
-                .encode(
+            if let Some(dpi) = meta.dpi {
+                let dpi = dpi.round().clamp(1.0, u16::MAX as f32) as u16;
+                encoder.set_density(jpeg_encoder::PixelDensity::dpi(dpi));
+            }
+            let result = match &gray {
+                Some(gray) => {
+                    encoder.encode(gray, w as u16, h as u16, jpeg_encoder::ColorType::Luma)
+                }
+                None => encoder.encode(
                     pixmap.data(),
                     w as u16,
                     h as u16,
                     jpeg_encoder::ColorType::Rgba,
-                )
-                .map_err(|e| format!("ошибка кодирования JPEG: {e}"))?;
+                ),
+            };
+            result.map_err(|e| format!("ошибка кодирования JPEG: {e}"))?;
         }
         ImageKind::Png { compression } => {
-            use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+            let mut encoder = png::Encoder::new(&mut out, w, h);
+            encoder.set_depth(png::BitDepth::Eight);
             // Уровни подобраны замером на документах: уровень 1 почти так же
-            // быстр, как Fast (fdeflate), но файл в 2–4 раза меньше; уровень 4
-            // даёт размер как у Default (≈ уровень 6) вдвое быстрее.
-            let compression = match compression {
-                PngCompression::Fast => CompressionType::Level(1),
-                PngCompression::Default => CompressionType::Level(4),
-                PngCompression::Best => CompressionType::Best,
-            };
-            let mut rgb = try_buffer(w as usize * h as usize * 3)?;
-            for p in pixmap.data().as_chunks::<4>().0.iter() {
-                rgb.extend_from_slice(&p[..3]);
+            // быстр, как fdeflate, но файл в 2–4 раза меньше; уровень 4 даёт
+            // размер как у стандартного (≈ уровень 6) вдвое быстрее.
+            match compression {
+                PngCompression::Fast => {
+                    encoder.set_deflate_compression(png::DeflateCompression::Level(1))
+                }
+                PngCompression::Default => {
+                    encoder.set_deflate_compression(png::DeflateCompression::Level(4))
+                }
+                PngCompression::Best => encoder.set_compression(png::Compression::High),
             }
-            let encoder = PngEncoder::new_with_quality(&mut out, compression, FilterType::Adaptive);
-            image::ImageEncoder::write_image(encoder, &rgb, w, h, image::ExtendedColorType::Rgb8)
-                .map_err(|e| format!("ошибка кодирования PNG: {e}"))?;
+            encoder.set_filter(png::Filter::Adaptive);
+            if let Some(dpi) = meta.dpi {
+                // pHYs хранит точки на метр
+                let ppm = (dpi as f64 / 0.0254).round() as u32;
+                encoder.set_pixel_dims(Some(png::PixelDimensions {
+                    xppu: ppm,
+                    yppu: ppm,
+                    unit: png::Unit::Meter,
+                }));
+            }
+            let data = match gray {
+                Some(gray) => {
+                    encoder.set_color(png::ColorType::Grayscale);
+                    gray
+                }
+                None => {
+                    encoder.set_color(png::ColorType::Rgb);
+                    let mut rgb = try_buffer(pixels * 3)?;
+                    for p in pixmap.data().as_chunks::<4>().0.iter() {
+                        rgb.extend_from_slice(&p[..3]);
+                    }
+                    rgb
+                }
+            };
+            let png_error = |e: png::EncodingError| format!("ошибка кодирования PNG: {e}");
+            let mut writer = encoder.write_header().map_err(png_error)?;
+            writer.write_image_data(&data).map_err(png_error)?;
+            writer.finish().map_err(png_error)?;
         }
     }
     if out.len() > max_bytes {
@@ -1858,7 +2180,18 @@ pub fn encode_to_file(
     kind: &ImageKind,
     max_bytes: usize,
 ) -> Result<(), String> {
-    let bytes = encode_to_vec(pixmap, kind, max_bytes)?;
+    encode_image_to_file(pixmap, path, kind, max_bytes, ImageMeta::default())
+}
+
+/// Как [`encode_to_file`], с разрешением и признаком оттенков серого.
+pub fn encode_image_to_file(
+    pixmap: &Pixmap,
+    path: &Path,
+    kind: &ImageKind,
+    max_bytes: usize,
+    meta: ImageMeta,
+) -> Result<(), String> {
+    let bytes = encode_image(pixmap, kind, max_bytes, meta)?;
     write_atomically(path, &bytes)
 }
 
@@ -2855,5 +3188,135 @@ mod tests {
         assert!(white_pixmap(0, 5).is_err());
         let e = try_buffer(usize::MAX).unwrap_err();
         assert!(e.contains("недостаточно памяти"), "{e}");
+    }
+
+    fn generated(name: &str) -> Document {
+        parse_file(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../mxl-demo-collection/generated")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn paginate_by_size_and_breaks() {
+        // элементы по 10 px, страница 25 px
+        let bounds: Vec<f32> = (0..=10).map(|i| i as f32 * 10.0).collect();
+        assert_eq!(
+            paginate(&bounds, 0, 9, 25.0, &[]),
+            vec![(0, 1), (2, 3), (4, 5), (6, 7), (8, 9)]
+        );
+        // явный разрыв после 2
+        assert_eq!(paginate(&bounds, 0, 5, 100.0, &[2]), vec![(0, 2), (3, 5)]);
+        // элемент длиннее страницы — отдельная страница
+        let tall = [0.0, 5.0, 105.0, 110.0];
+        assert_eq!(
+            paginate(&tall, 0, 2, 50.0, &[]),
+            vec![(0, 0), (1, 1), (2, 2)]
+        );
+    }
+
+    #[test]
+    fn print_job_pages_follow_paper_scale_and_orientation() {
+        let cases = [
+            (
+                demo_doc("ДемонстрацияПечатиРазрывов_A4_Книжная.mxl"),
+                6,
+                (827, 1169),
+            ),
+            (
+                demo_doc("ДемонстрацияПечатиРазрывов_A4_Альбомная.mxl"),
+                6,
+                (1169, 827),
+            ),
+            (
+                demo_doc("ДемонстрацияПечатиРазрывов_A3_Книжная.mxl"),
+                6,
+                (1169, 1654),
+            ),
+            (generated("Печать_A4_Альбомная_50.mxl"), 3, (1169, 827)),
+            (generated("Печать_A5_Книжная.mxl"), 9, (583, 827)),
+            (
+                generated("Печать_A3_Альбомная_Автомасштаб.mxl"),
+                3,
+                (1654, 1169),
+            ),
+            (generated("ДлиннаяТаблица_БезРазрывов.mxl"), 20, (827, 1169)),
+        ];
+        for (doc, pages, paper) in cases {
+            let job = PrintJob::new(&doc, 100).unwrap();
+            assert_eq!(job.page_count(), pages, "{:?}", doc.page_setup);
+            assert_eq!(job.paper_size_px(), paper);
+            let sheet = job.render(&doc, 1).unwrap();
+            assert_eq!((sheet.width(), sheet.height()), paper);
+        }
+        // автомасштаб уменьшает таблицу шириной ~400 мм до ширины A3 (396 мм)
+        let auto = PrintJob::new(&generated("Печать_A3_Альбомная_Автомасштаб.mxl"), 100).unwrap();
+        assert!(
+            (0.95..1.0).contains(&auto.print_scale()),
+            "{}",
+            auto.print_scale()
+        );
+    }
+
+    #[test]
+    fn print_sheet_has_margins_and_black_and_white() {
+        let doc = demo_doc("ДемонстрацияПечатиРазрывов_A4_Книжная.mxl");
+        let job = PrintJob::new(&doc, 100).unwrap();
+        let sheet = job.render(&doc, 1).unwrap();
+        // ЧерноБелаяПечать = Истина
+        assert!(is_grayscale(&sheet));
+        // поле сверху 10 мм (39 px при 100 DPI) — белое
+        let w = sheet.width() as usize;
+        let row_is_white = |y: usize| {
+            sheet.data()[y * w * 4..(y + 1) * w * 4]
+                .iter()
+                .all(|&b| b == 255)
+        };
+        assert!((0..35).all(row_is_white));
+        assert!(!row_is_white(45), "под полем начинается содержимое");
+        // цветная печать
+        let color = generated("Печать_A4_Книжная_Цветная.mxl");
+        let color_sheet = PrintJob::new(&color, 100)
+            .unwrap()
+            .render(&color, 1)
+            .unwrap();
+        assert!(!is_grayscale(&color_sheet));
+        // несуществующая страница
+        let e = job.render(&doc, 7).unwrap_err();
+        assert!(e.contains("6 стр."), "{e}");
+    }
+
+    #[test]
+    fn image_meta_writes_dpi_and_grayscale() {
+        let mut pm = render(&synthetic_doc(), 100).unwrap();
+        to_grayscale(&mut pm);
+        let meta = ImageMeta {
+            dpi: Some(150.0),
+            grayscale: true,
+        };
+        let png_bytes = encode_image(&pm, &ImageKind::PNG, DEFAULT_MAX_IMAGE_BYTES, meta).unwrap();
+        let decoder = png::Decoder::new(std::io::Cursor::new(&png_bytes));
+        let reader = decoder.read_info().unwrap();
+        let info = reader.info();
+        assert_eq!(info.color_type, png::ColorType::Grayscale);
+        let dims = info.pixel_dims.unwrap();
+        assert_eq!(dims.unit, png::Unit::Meter);
+        assert_eq!(dims.xppu, 5906); // 150 / 0.0254
+                                     // JFIF: единицы (1 = точки на дюйм) и плотность по X
+        let jpg = encode_image(
+            &pm,
+            &ImageKind::Jpeg { quality: 90 },
+            DEFAULT_MAX_IMAGE_BYTES,
+            meta,
+        )
+        .unwrap();
+        assert_eq!(&jpg[6..11], b"JFIF\0");
+        assert_eq!(jpg[13], 1);
+        assert_eq!(u16::from_be_bytes([jpg[14], jpg[15]]), 150);
+        // декодируется как картинка того же размера
+        let img = image::load_from_memory(&jpg).unwrap();
+        assert_eq!((img.width(), img.height()), (pm.width(), pm.height()));
     }
 }

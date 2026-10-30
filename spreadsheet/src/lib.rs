@@ -28,7 +28,7 @@ use native_api_1c::{
     native_api_1c_macro::{extern_functions, AddIn},
 };
 
-use converter::{ImageKind, PngCompression};
+use converter::{ImageKind, ImageMeta, PngCompression, PrintJob};
 
 const COMPONENT_NAME: &str = "SpreadSheet";
 
@@ -79,6 +79,19 @@ pub struct SpreadSheet {
     /// Степень сжатия PNG: 0 — быстро, 1 — обычно (по умолчанию), 2 — максимально
     #[add_in_prop(ty = Int, name = "PngCompression", name_ru = "СжатиеPNG", readable, writable)]
     pub png_compression: i32,
+
+    /// Режим «как при печати» для MXL: каждая страница — картинка листа
+    /// (формат, ориентация, поля, масштаб печати из параметров документа)
+    #[add_in_prop(ty = Bool, name = "PrintMode", name_ru = "РежимПечати", readable, writable)]
+    pub print_mode: bool,
+
+    /// Разрешение листа в режиме печати, DPI (50..600)
+    #[add_in_prop(ty = Int, name = "PrintDpi", name_ru = "РазрешениеПечати", readable, writable)]
+    pub print_dpi: i32,
+
+    /// Вывод в оттенках серого (для любого документа и режима)
+    #[add_in_prop(ty = Bool, name = "Grayscale", name_ru = "ОттенкиСерого", readable, writable)]
+    pub grayscale: bool,
 
     /// Вызывать исключение при ошибке (по умолчанию Истина). При Ложь метод
     /// возвращает Ложь / пустые ДвоичныеДанные, текст — в ОписаниеОшибки.
@@ -151,6 +164,22 @@ pub struct SpreadSheet {
     #[returns(ty = Int, result)]
     pub page_count_from_data: fn(&mut Self, Vec<u8>) -> Result<i32, ()>,
 
+    /// СохранитьСтраницы(ПутьКФайлу, ШаблонИмени, ТипКартинки) -> Число
+    #[add_in_func(name = "SavePages", name_ru = "СохранитьСтраницы")]
+    #[arg(ty = Str)]
+    #[arg(ty = Str)]
+    #[arg(ty = Str)]
+    #[returns(ty = Int, result)]
+    pub save_pages: fn(&mut Self, String, String, String) -> Result<i32, ()>,
+
+    /// СохранитьСтраницыИзДанных(Данные, ШаблонИмени, ТипКартинки) -> Число
+    #[add_in_func(name = "SavePagesFromData", name_ru = "СохранитьСтраницыИзДанных")]
+    #[arg(ty = Blob)]
+    #[arg(ty = Str)]
+    #[arg(ty = Str)]
+    #[returns(ty = Int, result)]
+    pub save_pages_from_data: fn(&mut Self, Vec<u8>, String, String) -> Result<i32, ()>,
+
     /// Буфер обмена держится открытым, пока жив объект компоненты: в Linux
     /// (X11/Wayland) содержимое буфера обмена отдаёт сам процесс-владелец, и
     /// при закрытии объекта `arboard::Clipboard` сразу после вызова картинка
@@ -171,6 +200,9 @@ impl Default for SpreadSheet {
             image_margins: 0,
             max_image_bytes: converter::DEFAULT_MAX_IMAGE_BYTES as i32,
             png_compression: 1,
+            print_mode: false,
+            print_dpi: 150,
+            grayscale: false,
             throw_errors: true,
             last_error: String::new(),
             save_picture: Self::save_picture_inner,
@@ -181,6 +213,8 @@ impl Default for SpreadSheet {
             get_picture_from_data_to_clipboard: Self::get_picture_from_data_to_clipboard_inner,
             page_count: Self::page_count_inner,
             page_count_from_data: Self::page_count_from_data_inner,
+            save_pages: Self::save_pages_inner,
+            save_pages_from_data: Self::save_pages_from_data_inner,
             clipboard: None,
         }
     }
@@ -278,6 +312,26 @@ impl SpreadSheet {
         self.finish(result, 0)
     }
 
+    fn save_pages_inner(
+        &mut self,
+        path: String,
+        template: String,
+        image_type: String,
+    ) -> Result<i32, ()> {
+        let result = guarded(|| self.save_pages(Source::File(&path), &template, &image_type));
+        self.finish(result, 0)
+    }
+
+    fn save_pages_from_data_inner(
+        &mut self,
+        data: Vec<u8>,
+        template: String,
+        image_type: String,
+    ) -> Result<i32, ()> {
+        let result = guarded(|| self.save_pages(Source::Data(&data), &template, &image_type));
+        self.finish(result, 0)
+    }
+
     fn save_picture_from(
         &mut self,
         source: Source,
@@ -285,12 +339,13 @@ impl SpreadSheet {
         image_type: &str,
     ) -> Result<bool, ()> {
         let result = guarded(|| {
-            let (pixmap, settings) = self.prepare_pixmap(source, image_type)?;
-            converter::encode_to_file(
+            let (pixmap, settings, meta) = self.prepare_pixmap(source, image_type)?;
+            converter::encode_image_to_file(
                 &pixmap,
                 Path::new(image_path),
                 &settings.kind,
                 settings.max_bytes,
+                meta,
             )
         });
         self.finish(result.map(|()| true), false)
@@ -298,8 +353,8 @@ impl SpreadSheet {
 
     fn get_picture_from(&mut self, source: Source, image_type: &str) -> Result<Vec<u8>, ()> {
         let result = guarded(|| {
-            let (pixmap, settings) = self.prepare_pixmap(source, image_type)?;
-            converter::encode_to_vec(&pixmap, &settings.kind, settings.max_bytes)
+            let (pixmap, settings, meta) = self.prepare_pixmap(source, image_type)?;
+            converter::encode_image(&pixmap, &settings.kind, settings.max_bytes, meta)
         });
         self.finish(result, Vec::new())
     }
@@ -310,7 +365,7 @@ impl SpreadSheet {
         image_type: &str,
     ) -> Result<bool, ()> {
         let result = guarded(|| {
-            let (pixmap, _settings) = self.prepare_pixmap(source, image_type)?;
+            let (pixmap, _settings, _meta) = self.prepare_pixmap(source, image_type)?;
             self.set_clipboard_image(&pixmap)
         });
         self.finish(result.map(|()| true), false)
@@ -434,6 +489,29 @@ impl SpreadSheet {
         })
     }
 
+    /// Проверяет `ИнтервалСтраницPDF` (интервал при склеивании страниц PDF и
+    /// листов в режиме печати).
+    fn page_spacing(&self) -> Result<u32, String> {
+        if !(0..=200).contains(&self.pdf_page_spacing) {
+            return Err(format!(
+                "недопустимый ИнтервалСтраницPDF {}: ожидается от 0 до 200 пикселей",
+                self.pdf_page_spacing
+            ));
+        }
+        Ok(self.pdf_page_spacing as u32)
+    }
+
+    /// Проверяет `РазрешениеПечати`.
+    fn print_dpi(&self) -> Result<u32, String> {
+        if !(50..=600).contains(&self.print_dpi) {
+            return Err(format!(
+                "недопустимое РазрешениеПечати {}: ожидается от 50 до 600 DPI",
+                self.print_dpi
+            ));
+        }
+        Ok(self.print_dpi as u32)
+    }
+
     /// Проверяет свойства, относящиеся только к PDF.
     fn pdf_settings(&self) -> Result<(u32, u32, u32), String> {
         let page_number = self.page_number()?;
@@ -443,17 +521,7 @@ impl SpreadSheet {
                 self.pdf_dpi
             ));
         }
-        if !(0..=200).contains(&self.pdf_page_spacing) {
-            return Err(format!(
-                "недопустимый ИнтервалСтраницPDF {}: ожидается от 0 до 200 пикселей",
-                self.pdf_page_spacing
-            ));
-        }
-        Ok((
-            page_number,
-            self.pdf_dpi as u32,
-            self.pdf_page_spacing as u32,
-        ))
+        Ok((page_number, self.pdf_dpi as u32, self.page_spacing()?))
     }
 
     /// Определяет тип документа и разбирает MXL.
@@ -492,32 +560,135 @@ impl SpreadSheet {
         }
     }
 
-    /// Общая часть методов: проверка свойств и типа, разбор и рендер.
+    /// Общая часть методов: проверка свойств и типа, разбор и рендер
+    /// страницы `НомерСтраницы` (0 — весь документ / все листы).
     fn prepare_pixmap<'a>(
         &self,
         source: impl Into<Source<'a>>,
         image_type: &str,
-    ) -> Result<(tiny_skia::Pixmap, Settings), String> {
+    ) -> Result<(tiny_skia::Pixmap, Settings, ImageMeta), String> {
         let settings = self.settings(image_type)?;
-        let pixmap = match self.load(source.into())? {
+        let page_number = self.page_number()?;
+        let (pixmap, meta) = match self.load(source.into())? {
             Loaded::Pdf(input) => {
-                let (page_number, dpi, spacing) = self.pdf_settings()?;
-                pdf_renderer::render_pdf(input, settings.scale, page_number, dpi, spacing)?
+                let (_, dpi, spacing) = self.pdf_settings()?;
+                let pixmap =
+                    pdf_renderer::render_pdf(input, settings.scale, page_number, dpi, spacing)?;
+                (pixmap, pdf_meta(dpi, settings.scale))
             }
-            Loaded::Mxl(doc) => match self.page_number()? {
-                0 => converter::render(&doc, settings.scale)?,
-                page => converter::render_page(&doc, settings.scale, page)?,
-            },
+            Loaded::Mxl(doc) if self.print_mode => {
+                let job = PrintJob::new(&doc, self.print_dpi()?)?;
+                let pixmap = match page_number {
+                    0 => self.render_all_sheets(&doc, &job)?,
+                    page => job.render(&doc, page)?,
+                };
+                (pixmap, self.print_meta(&doc)?)
+            }
+            Loaded::Mxl(doc) => {
+                let pixmap = match page_number {
+                    0 => converter::render(&doc, settings.scale)?,
+                    page => converter::render_page(&doc, settings.scale, page)?,
+                };
+                (pixmap, screen_meta(settings.scale))
+            }
         };
-        let pixmap = apply_margins(pixmap, settings.margins)?;
-        Ok((pixmap, settings))
+        let (pixmap, meta) = self.finish_pixmap(pixmap, meta, &settings)?;
+        Ok((pixmap, settings, meta))
     }
 
-    /// Число страниц документа (MXL — по области печати и разрывам).
+    /// Все листы режима печати, склеенные вертикально.
+    fn render_all_sheets(
+        &self,
+        doc: &mxl_parser::Document,
+        job: &PrintJob,
+    ) -> Result<tiny_skia::Pixmap, String> {
+        let spacing = self.page_spacing()?;
+        let (w, h) = job.paper_size_px();
+        let sizes = vec![(w as u64, h as u64); job.page_count()];
+        pdf_renderer::check_stacked_size(&sizes, spacing)?;
+        let sheets = (1..=job.page_count() as u32)
+            .map(|page| job.render(doc, page))
+            .collect::<Result<Vec<_>, _>>()?;
+        pdf_renderer::stack_pages(&sheets, spacing)
+    }
+
+    fn print_meta(&self, doc: &mxl_parser::Document) -> Result<ImageMeta, String> {
+        Ok(ImageMeta {
+            dpi: Some(self.print_dpi()? as f32),
+            grayscale: doc.page_setup.black_and_white,
+        })
+    }
+
+    /// Поля и оттенки серого — для любого источника и режима.
+    fn finish_pixmap(
+        &self,
+        pixmap: tiny_skia::Pixmap,
+        mut meta: ImageMeta,
+        settings: &Settings,
+    ) -> Result<(tiny_skia::Pixmap, ImageMeta), String> {
+        let mut pixmap = apply_margins(pixmap, settings.margins)?;
+        if self.grayscale {
+            converter::to_grayscale(&mut pixmap);
+            meta.grayscale = true;
+        }
+        Ok((pixmap, meta))
+    }
+
+    /// Число страниц документа: PDF — страницы файла; MXL — по области
+    /// печати и разрывам, а в режиме печати — листы.
     fn count_pages(&self, source: Source) -> Result<i32, String> {
         let count = match self.load(source)? {
             Loaded::Pdf(input) => pdf_renderer::page_count(input)? as usize,
+            Loaded::Mxl(doc) if self.print_mode => {
+                PrintJob::new(&doc, self.print_dpi()?)?.page_count()
+            }
             Loaded::Mxl(doc) => converter::pages(&doc).len(),
+        };
+        Ok(count.min(i32::MAX as usize) as i32)
+    }
+
+    /// Сохраняет каждую страницу в отдельный файл по шаблону имени.
+    fn save_pages(&self, source: Source, template: &str, image_type: &str) -> Result<i32, String> {
+        let settings = self.settings(image_type)?;
+        if template.trim().is_empty() {
+            return Err("не задан ШаблонИмени файлов страниц".to_string());
+        }
+        let save = |page: u32, pixmap: tiny_skia::Pixmap, meta: ImageMeta| {
+            let (pixmap, meta) = self.finish_pixmap(pixmap, meta, &settings)?;
+            converter::encode_image_to_file(
+                &pixmap,
+                Path::new(&page_file_name(template, page)),
+                &settings.kind,
+                settings.max_bytes,
+                meta,
+            )
+        };
+        let count = match self.load(source)? {
+            Loaded::Pdf(input) => {
+                let (_, dpi, _) = self.pdf_settings()?;
+                let count = pdf_renderer::page_count(input)?;
+                for page in 1..=count {
+                    let pixmap = pdf_renderer::render_pdf(input, settings.scale, page, dpi, 0)?;
+                    save(page, pixmap, pdf_meta(dpi, settings.scale))?;
+                }
+                count as usize
+            }
+            Loaded::Mxl(doc) if self.print_mode => {
+                let job = PrintJob::new(&doc, self.print_dpi()?)?;
+                let meta = self.print_meta(&doc)?;
+                for page in 1..=job.page_count() as u32 {
+                    save(page, job.render(&doc, page)?, meta)?;
+                }
+                job.page_count()
+            }
+            Loaded::Mxl(doc) => {
+                let count = converter::pages(&doc).len();
+                for page in 1..=count as u32 {
+                    let pixmap = converter::render_page(&doc, settings.scale, page)?;
+                    save(page, pixmap, screen_meta(settings.scale))?;
+                }
+                count
+            }
         };
         Ok(count.min(i32::MAX as usize) as i32)
     }
@@ -530,6 +701,38 @@ impl SpreadSheet {
                 &format!("{COMPONENT_NAME}: {message}"),
             );
         }
+    }
+}
+
+/// Разрешение картинки экранного режима: 96 DPI × Масштаб.
+fn screen_meta(scale: u32) -> ImageMeta {
+    ImageMeta {
+        dpi: Some(96.0 * scale as f32 / 100.0),
+        grayscale: false,
+    }
+}
+
+/// Разрешение картинки PDF: РазрешениеPDF × Масштаб.
+fn pdf_meta(dpi: u32, scale: u32) -> ImageMeta {
+    ImageMeta {
+        dpi: Some(pdf_renderer::effective_dpi(dpi, scale)),
+        grayscale: false,
+    }
+}
+
+/// Имя файла страницы: `{N}` в шаблоне заменяется номером страницы, а без
+/// него номер добавляется перед расширением (`стр.png` → `стр_1.png`).
+fn page_file_name(template: &str, page: u32) -> String {
+    if template.contains("{N}") {
+        return template.replace("{N}", &page.to_string());
+    }
+    let name_start = template.rfind(['/', '\\']).map_or(0, |i| i + 1);
+    match template[name_start..].rfind('.') {
+        Some(dot) if dot > 0 => {
+            let dot = name_start + dot;
+            format!("{}_{page}{}", &template[..dot], &template[dot..])
+        }
+        _ => format!("{template}_{page}"),
     }
 }
 
@@ -961,5 +1164,130 @@ mod tests {
         );
         let from_file = (addin.get_picture)(&mut addin, file.path().into(), "PNG".into()).unwrap();
         assert_eq!(bytes, from_file);
+    }
+
+    #[test]
+    fn page_file_names() {
+        assert_eq!(
+            page_file_name("C:\\out\\стр_{N}.png", 3),
+            "C:\\out\\стр_3.png"
+        );
+        assert_eq!(page_file_name("/tmp/doc.png", 2), "/tmp/doc_2.png");
+        assert_eq!(page_file_name("/tmp/v1.0/doc", 2), "/tmp/v1.0/doc_2");
+        assert_eq!(page_file_name("/tmp/.png", 1), "/tmp/.png_1");
+    }
+
+    #[test]
+    fn print_mode_page_count_and_sheet_size() {
+        let path = printing_demo_path();
+        let mut addin = SpreadSheet {
+            print_mode: true,
+            ..Default::default()
+        };
+        assert_eq!((addin.page_count)(&mut addin, path.clone()), Ok(6));
+        addin.page_number = 2;
+        let bytes = (addin.get_picture)(&mut addin, path.clone(), "PNG".into()).unwrap();
+        let decoder = png::Decoder::new(std::io::Cursor::new(&bytes));
+        let reader = decoder.read_info().unwrap();
+        // A4 при 150 DPI, ч/б печать — PNG в оттенках серого
+        assert_eq!((reader.info().width, reader.info().height), (1240, 1754));
+        assert_eq!(reader.info().color_type, png::ColorType::Grayscale);
+        addin.print_dpi = 10;
+        addin.throw_errors = false;
+        let r = (addin.get_picture)(&mut addin, path, "PNG".into());
+        assert_eq!(r, Ok(Vec::new()));
+        assert!(
+            addin.last_error.contains("РазрешениеПечати"),
+            "{}",
+            addin.last_error
+        );
+    }
+
+    #[test]
+    fn all_sheets_are_stacked_when_page_number_is_zero() {
+        let mut addin = SpreadSheet {
+            print_mode: true,
+            print_dpi: 50,
+            pdf_page_spacing: 4,
+            ..Default::default()
+        };
+        let bytes = (addin.get_picture)(&mut addin, printing_demo_path(), "PNG".into()).unwrap();
+        let img = image::load_from_memory(&bytes).unwrap();
+        // 6 листов A4 при 50 DPI (413×585) с интервалом 4 px
+        assert_eq!((img.width(), img.height()), (413, 6 * 585 + 5 * 4));
+    }
+
+    #[test]
+    fn grayscale_property_and_screen_dpi() {
+        let mut addin = SpreadSheet {
+            grayscale: true,
+            scale: 200,
+            ..Default::default()
+        };
+        let bytes = (addin.get_picture)(&mut addin, demo_mxl(), "PNG".into()).unwrap();
+        let decoder = png::Decoder::new(std::io::Cursor::new(&bytes));
+        let reader = decoder.read_info().unwrap();
+        assert_eq!(reader.info().color_type, png::ColorType::Grayscale);
+        // экранный режим: 96 DPI × 200%
+        assert_eq!(reader.info().pixel_dims.unwrap().xppu, 7559);
+    }
+
+    #[test]
+    fn save_pages_writes_one_file_per_page() {
+        let dir = std::env::temp_dir().join(format!("spreadsheet_pages_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let template = dir.join("стр_{N}.jpg").to_string_lossy().into_owned();
+        // экранный режим: страницы по разрывам (3)
+        let mut addin = SpreadSheet::default();
+        assert_eq!(
+            (addin.save_pages)(
+                &mut addin,
+                printing_demo_path(),
+                template.clone(),
+                "JPEG".into()
+            ),
+            Ok(3)
+        );
+        for n in 1..=3 {
+            let file = dir.join(format!("стр_{n}.jpg"));
+            assert!(
+                std::fs::read(&file).unwrap().starts_with(&[0xFF, 0xD8]),
+                "{n}"
+            );
+        }
+        // режим печати: 6 листов, из данных
+        addin.print_mode = true;
+        addin.print_dpi = 50;
+        let data = std::fs::read(printing_demo_path()).unwrap();
+        let template = dir.join("лист.png").to_string_lossy().into_owned();
+        assert_eq!(
+            (addin.save_pages_from_data)(&mut addin, data, template, "PNG".into()),
+            Ok(6)
+        );
+        assert!(dir.join("лист_6.png").is_file());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_pages_of_pdf() {
+        if !pdf_tools_available() {
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("spreadsheet_pdf_pages_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf = minimal_pdf(&[(595, 842), (842, 595)]);
+        let mut addin = SpreadSheet::default();
+        let template = dir.join("p{N}.png").to_string_lossy().into_owned();
+        assert_eq!(
+            (addin.save_pages_from_data)(&mut addin, pdf, template, "PNG".into()),
+            Ok(2)
+        );
+        let second = image::open(dir.join("p2.png")).unwrap();
+        assert!(
+            second.width() > second.height(),
+            "вторая страница альбомная"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

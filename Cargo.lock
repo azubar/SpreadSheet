@@ -980,13 +980,14 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "spreadsheet"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "ab_glyph",
  "arboard",
  "image",
  "jpeg-encoder",
  "native_api_1c",
+ "png 0.18.1",
  "tempfile",
  "tiny-skia",
  "utf16_lit",
