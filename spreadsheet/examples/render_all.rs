@@ -39,7 +39,7 @@ fn main() {
                 convert(
                     &doc,
                     &out_dir.join(format!("{stem}.png")),
-                    &ImageKind::Png,
+                    &ImageKind::PNG,
                     scale,
                 )
             });

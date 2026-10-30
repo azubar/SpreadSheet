@@ -28,6 +28,8 @@
 use std::fmt;
 use std::path::Path;
 
+use crate::format1c::{format_value, parse_date, CellValue};
+
 // ---------------------------------------------------------------------------
 // Ошибки
 // ---------------------------------------------------------------------------
@@ -208,10 +210,70 @@ pub struct CellFormat {
     pub text_control: Option<u32>,
     /// Ориентация текста в десятых долях градуса (900 = вертикально, 90°)
     pub orientation: Option<u32>,
+    /// Форматная строка значения — индекс в таблице числовых форматов
+    /// документа (`Document::number_formats`, 0-базный)
+    pub number_format: Option<u32>,
+}
+
+/// Семейство шрифта для рендера: имя шрифта из документа сводится к одному
+/// из встроенных метрически совместимых семейств Liberation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FontFamily {
+    /// Без засечек: Arial, Tahoma, Verdana, Calibri и др. (Liberation Sans)
+    #[default]
+    Sans,
+    /// С засечками: Times New Roman, Georgia и др. (Liberation Serif)
+    Serif,
+    /// Моноширинный: Courier New, Consolas и др. (Liberation Mono)
+    Mono,
+}
+
+impl FontFamily {
+    /// Семейство по имени шрифта из документа.
+    pub fn from_name(name: &str) -> FontFamily {
+        let n = name.to_lowercase();
+        const MONO: [&str; 10] = [
+            "courier",
+            "consolas",
+            "mono",
+            "lucida console",
+            "fixedsys",
+            "terminal",
+            "monaco",
+            "menlo",
+            "inconsolata",
+            "source code",
+        ];
+        const SERIF: [&str; 12] = [
+            "times",
+            "georgia",
+            "cambria",
+            "garamond",
+            "antiqua",
+            "palatino",
+            "bookman",
+            "century",
+            "constantia",
+            "baskerville",
+            "tinos",
+            "pt serif",
+        ];
+        if MONO.iter().any(|m| n.contains(m)) {
+            FontFamily::Mono
+        } else if SERIF.iter().any(|m| n.contains(m))
+            || (n.contains("serif") && !n.contains("sans"))
+        {
+            FontFamily::Serif
+        } else {
+            FontFamily::Sans
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct FontSpec {
+    /// Семейство (по имени шрифта)
+    pub family: FontFamily,
     /// Размер в десятых долях пункта (80 = 8 pt)
     pub size_tenth_pt: u32,
     pub bold: bool,
@@ -223,6 +285,7 @@ pub struct FontSpec {
 impl Default for FontSpec {
     fn default() -> Self {
         FontSpec {
+            family: FontFamily::Sans,
             size_tenth_pt: 80,
             bold: false,
             italic: false,
@@ -252,11 +315,15 @@ pub enum ColorSpec {
     Auto,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Cell {
     /// Индекс формата, 1-базный; 0 = формата нет
     pub format: u32,
+    /// Текст ячейки; для ячейки со значением — представление значения по
+    /// форматной строке (заполняется после разбора всего документа)
     pub text: Option<String>,
+    /// Значение ячейки («Содержит значение»): число, дата, булево, строка
+    pub value: Option<CellValue>,
 }
 
 #[derive(Debug, Clone)]
@@ -317,8 +384,185 @@ pub struct Drawing {
     pub picture: Option<u32>,
 }
 
+/// Область печати: границы включительно, 0-базные; `None` — граница не
+/// ограничена (область вида «строки» или «колонки»).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PrintArea {
+    pub left: Option<u32>,
+    pub top: Option<u32>,
+    pub right: Option<u32>,
+    pub bottom: Option<u32>,
+}
+
+/// Параметры печати документа (запись `{{0, N, (ключ, {тип, значение}) × N}}`,
+/// см. docs/format-mxl.md, §5.1). Поля, не заданные в файле, — значения 1С
+/// по умолчанию.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageSetup {
+    /// Имя формата листа (`РазмерСтраницы`): "A4", "A3", "Letter"…;
+    /// `None` — не задано (1С берёт A4 или настройки принтера)
+    pub paper: Option<String>,
+    /// Размер листа в мм из файла (ключи 16/17) — для пользовательского
+    /// формата; у стандартных форматов размер берётся из имени
+    pub custom_size_mm: Option<(f64, f64)>,
+    /// Альбомная ориентация
+    pub landscape: bool,
+    /// Масштаб печати, %
+    pub scale: u32,
+    /// Автомасштаб: вписать по ширине страницы
+    pub auto_scale: bool,
+    /// Поля сверху, слева, снизу, справа, мм
+    pub margins_mm: [f64; 4],
+    /// Высота колонтитулов сверху и снизу, мм
+    pub header_footer_mm: [f64; 2],
+    /// Чёрно-белая печать
+    pub black_and_white: bool,
+}
+
+impl Default for PageSetup {
+    fn default() -> Self {
+        PageSetup {
+            paper: None,
+            custom_size_mm: None,
+            landscape: false,
+            scale: 100,
+            auto_scale: false,
+            margins_mm: [10.0; 4],
+            header_footer_mm: [10.0; 2],
+            black_and_white: false,
+        }
+    }
+}
+
+/// Стандартные форматы листа, мм (книжная ориентация).
+const PAPER_SIZES_MM: [(&str, f64, f64); 12] = [
+    ("A3", 297.0, 420.0),
+    ("A4", 210.0, 297.0),
+    ("A5", 148.0, 210.0),
+    ("A6", 105.0, 148.0),
+    ("B4", 250.0, 353.0),
+    ("B5", 176.0, 250.0),
+    ("Letter", 215.9, 279.4),
+    ("Legal", 215.9, 355.6),
+    ("Executive", 184.15, 266.7),
+    ("Tabloid", 279.4, 431.8),
+    ("Ledger", 431.8, 279.4),
+    ("Statement", 139.7, 215.9),
+];
+
+impl PageSetup {
+    /// Размер листа с учётом ориентации, мм (ширина, высота). Неизвестный
+    /// формат без размера в файле — A4.
+    pub fn paper_size_mm(&self) -> (f64, f64) {
+        let named = self.paper.as_deref().and_then(|name| {
+            let name = name.trim();
+            PAPER_SIZES_MM
+                .iter()
+                .find(|(n, _, _)| n.eq_ignore_ascii_case(name))
+                .map(|&(_, w, h)| (w, h))
+        });
+        let (w, h) = named.or(self.custom_size_mm).unwrap_or((210.0, 297.0));
+        if self.landscape {
+            (w.max(h), w.min(h))
+        } else {
+            (w.min(h), w.max(h))
+        }
+    }
+
+    /// Ширина и высота области печати (лист минус поля), мм.
+    pub fn printable_mm(&self) -> (f64, f64) {
+        let (w, h) = self.paper_size_mm();
+        let [top, left, bottom, right] = self.margins_mm;
+        ((w - left - right).max(10.0), (h - top - bottom).max(10.0))
+    }
+}
+
+/// Числовое значение `{"N", число}` (целое или дробное).
+fn typed_number(v: &Value) -> Option<f64> {
+    let fields = v.as_list()?;
+    if fields.first()?.as_str()? != "N" {
+        return None;
+    }
+    match fields.get(1)? {
+        Value::Num(n) => Some(*n as f64),
+        Value::Atom(a) => a.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Разбирает запись параметров печати `{{0, N, (ключ, значение) × N}}`.
+fn page_setup_from_value(v: &Value) -> Option<PageSetup> {
+    let outer = v.as_list()?;
+    if outer.len() != 1 {
+        return None;
+    }
+    let rec = outer[0].as_list()?;
+    if rec.len() < 2 || rec[0].as_num()? != 0 {
+        return None;
+    }
+    let count = rec[1].as_num()?;
+    let pairs = &rec[2..];
+    if count < 1 || pairs.len() != 2 * count as usize {
+        return None;
+    }
+    let mut setup = PageSetup::default();
+    let mut size = (None, None);
+    for pair in pairs.chunks(2) {
+        let key = pair[0].as_num()?;
+        let value = &pair[1];
+        // значение — объект {тип, значение}
+        value.as_list()?;
+        let num = typed_number(value);
+        match key {
+            0 => {
+                setup.paper = value
+                    .as_list()
+                    .and_then(|f| f.get(1))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }
+            1 => setup.landscape = num == Some(2.0),
+            2 => {
+                if let Some(n) = num.filter(|n| (1.0..=1000.0).contains(n)) {
+                    setup.scale = n.round() as u32;
+                }
+            }
+            6..=9 => {
+                if let Some(n) = num.filter(|n| *n >= 0.0) {
+                    setup.margins_mm[(key - 6) as usize] = n / 100.0;
+                }
+            }
+            10 | 11 => {
+                if let Some(n) = num.filter(|n| *n >= 0.0) {
+                    setup.header_footer_mm[(key - 10) as usize] = n / 100.0;
+                }
+            }
+            12 => setup.auto_scale = num.is_some_and(|n| n != 0.0),
+            13 => setup.black_and_white = num.is_some_and(|n| n != 0.0),
+            16 => size.0 = num.filter(|n| *n > 0.0),
+            17 => size.1 = num.filter(|n| *n > 0.0),
+            _ => {}
+        }
+    }
+    if let (Some(w), Some(h)) = size {
+        setup.custom_size_mm = Some((w, h));
+    }
+    Some(setup)
+}
+
+/// Признак разрыва страницы в формате строки/колонки (значение поля
+/// «другого измерения»: ширины для строки, высоты для колонки).
+const PAGE_BREAK_FLAG: u32 = 4;
+
 #[derive(Debug, Default)]
 pub struct Document {
+    /// Область печати документа
+    pub print_area: Option<PrintArea>,
+    /// Параметры печати (значения по умолчанию, если записи нет)
+    pub page_setup: PageSetup,
+    /// Таблица форматных строк значений (`ЧДЦ=2`, `ДФ=dd.MM.yyyy`…);
+    /// индексы из форматов 0-базные
+    pub number_formats: Vec<String>,
     pub rows: Vec<Row>,
     /// Таблица форматов; индексы из ячеек 1-базные: ячейка с format = i
     /// ссылается на formats[i-1]
@@ -361,6 +605,45 @@ impl Document {
             Some(ColorSpec::Rgb(r, g, b)) => Some((*r, *g, *b)),
             _ => None,
         }
+    }
+
+    /// Горизонтальные разрывы страниц: номера строк (0-базные), после
+    /// которых начинается новая страница. В файле разрыв хранится в формате
+    /// строки как значение поля ширины с битом 4.
+    pub fn row_breaks(&self) -> Vec<u32> {
+        let mut breaks: Vec<u32> = self
+            .rows
+            .iter()
+            .filter(|r| {
+                self.format(r.format)
+                    .and_then(|f| f.width)
+                    .is_some_and(|w| w & PAGE_BREAK_FLAG != 0)
+            })
+            .map(|r| r.index)
+            .collect();
+        breaks.sort_unstable();
+        breaks.dedup();
+        breaks
+    }
+
+    /// Вертикальные разрывы страниц: номера колонок (0-базные), после
+    /// которых начинается новая страница (поле высоты в формате колонки
+    /// группы по умолчанию с битом 4).
+    pub fn column_breaks(&self) -> Vec<u32> {
+        let mut breaks: Vec<u32> = self
+            .default_group
+            .columns
+            .iter()
+            .filter(|(_, fmt)| {
+                self.format(*fmt)
+                    .and_then(|f| f.height)
+                    .is_some_and(|h| h & PAGE_BREAK_FLAG != 0)
+            })
+            .map(|(col, _)| *col)
+            .collect();
+        breaks.sort_unstable();
+        breaks.dedup();
+        breaks
     }
 
     /// Группа колонок, действующая для строки.
@@ -420,13 +703,17 @@ fn cell_from_value(fields: &[Value]) -> Option<Cell> {
     let marker = fields[0].as_num()?;
     let format = fields[1].as_num().unwrap_or(0).max(0) as u32;
     let mut text = None;
-    // после формата: [ссылка если маркер&4], [текст если маркер&16]
+    let mut value = None;
+    // после формата: [значение если маркер&2], [ссылка если маркер&4],
+    // [текст если маркер&16]
     let mut next = 2usize;
     if marker & 2 != 0 {
-        // типизированное значение: {"S", "текст"}
+        // типизированное значение {тип, значение}: "S" — строка, "N" —
+        // число, "D" — дата ГГГГММДДччммсс, "B" — булево
         if let Some(tv) = fields.get(next).and_then(Value::as_list) {
-            if tv.len() >= 2 && tv[0].as_str() == Some("S") {
-                text = tv[1].as_str().map(str::to_string);
+            value = typed_value(tv);
+            if let Some(CellValue::Str(s)) = &value {
+                text = Some(s.clone());
             }
             next += 1;
         }
@@ -446,7 +733,65 @@ fn cell_from_value(fields: &[Value]) -> Option<Cell> {
             }
         }
     }
-    Some(Cell { format, text })
+    Some(Cell {
+        format,
+        text,
+        value,
+    })
+}
+
+/// Текстовое представление числа или атома (`123`, `-1234.5`).
+fn scalar_text(v: &Value) -> Option<String> {
+    match v {
+        Value::Num(n) => Some(n.to_string()),
+        Value::Atom(a) => Some(a.clone()),
+        Value::Str(s) => Some(s.clone()),
+        Value::List(_) => None,
+    }
+}
+
+/// Типизированное значение `{тип, значение}`.
+fn typed_value(tv: &[Value]) -> Option<CellValue> {
+    let kind = tv.first()?.as_str()?;
+    let raw = tv.get(1);
+    match kind {
+        "S" => raw?.as_str().map(|s| CellValue::Str(s.to_string())),
+        "N" => scalar_text(raw?).map(CellValue::Number),
+        "D" => parse_date(&scalar_text(raw?)?).map(CellValue::Date),
+        "B" => Some(CellValue::Bool(raw?.as_num()? != 0)),
+        _ => None,
+    }
+}
+
+/// Таблица форматных строк значений: `N, {1, 1, {язык, строка}} × N` —
+/// сразу после таблицы шрифтов.
+fn number_formats_from(root: &[Value], start: usize) -> Vec<String> {
+    let Some(n) = root.get(start).and_then(Value::as_num) else {
+        return Vec::new();
+    };
+    if !(1..=10_000).contains(&n) {
+        return Vec::new();
+    }
+    let entries: Vec<String> = root
+        .iter()
+        .skip(start + 1)
+        .take(n as usize)
+        .map_while(|v| first_string(v).map(str::to_string))
+        .collect();
+    if entries.len() == n as usize {
+        entries
+    } else {
+        Vec::new()
+    }
+}
+
+/// Первая строка (не код языка «#») внутри вложенного объекта.
+fn first_string(v: &Value) -> Option<&str> {
+    match v {
+        Value::Str(s) if s != "#" => Some(s),
+        Value::List(items) => items.iter().find_map(first_string),
+        _ => None,
+    }
 }
 
 /// Строгий разбор блока строк начиная с поля `start`.
@@ -472,6 +817,9 @@ fn parse_rows(root: &[Value], start: usize) -> Result<(Vec<Row>, usize), MxlErro
         if index <= prev || index < 0 {
             return err("MXL8: номера строк не возрастают — файл повреждён");
         }
+        if index > u32::MAX as i64 {
+            return err(format!("MXL8: недопустимый номер строки {index}"));
+        }
         if !(0..=100_000).contains(&ncells) {
             return err(format!("MXL8: неправдоподобное число ячеек {ncells}"));
         }
@@ -484,12 +832,13 @@ fn parse_rows(root: &[Value], start: usize) -> Result<(Vec<Row>, usize), MxlErro
                 .get(i + 1)
                 .and_then(Value::as_list)
                 .ok_or_else(|| MxlError("MXL8: ожидался объект ячейки".to_string()))?;
-            if col < 0 {
-                return err("MXL8: отрицательный номер колонки");
+            if !(0..=u32::MAX as i64).contains(&col) {
+                return err(format!("MXL8: недопустимый номер колонки {col}"));
             }
             let cell = cell_from_value(cell_fields).unwrap_or(Cell {
                 format: 0,
                 text: None,
+                value: None,
             });
             cells.push((col as u32, cell));
             i += 2;
@@ -518,7 +867,7 @@ fn column_group_from_value(v: &Value) -> Option<ColumnGroup> {
     for k in 0..n as usize {
         let col = fields[4 + 2 * k].as_num()?;
         let fmt = fields[5 + 2 * k].as_num()?;
-        if col < 0 || fmt < 0 {
+        if !(0..=u32::MAX as i64).contains(&col) || !(0..=u32::MAX as i64).contains(&fmt) {
             return None;
         }
         columns.push((col as u32, fmt as u32));
@@ -564,6 +913,7 @@ fn format_from_value(fields: &[Value]) -> CellFormat {
             13 => fmt.pattern_color = Some(v),
             14 => fmt.text_control = Some(v),
             18 => fmt.orientation = Some(v),
+            24 => fmt.number_format = Some(v),
             _ => {}
         }
     }
@@ -599,6 +949,10 @@ fn font_from_value(fields: &[Value]) -> FontSpec {
         font.italic = num(8) != 0;
         font.underline = num(9) != 0;
         font.strikeout = num(10) != 0;
+        // имя шрифта — единственная строка записи (после служебных чисел)
+        if let Some(name) = fields.iter().skip(3).find_map(Value::as_str) {
+            font.family = FontFamily::from_name(name);
+        }
         return font;
     }
     // виды 1-3: {7, вид, флаги, [{база}], значения по флагам...}
@@ -607,17 +961,18 @@ fn font_from_value(fields: &[Value]) -> FontSpec {
     if matches!(fields.get(vi), Some(Value::List(_))) {
         vi += 1;
     }
-    let mut take_num = |present: bool| -> Option<i64> {
+    let mut take = |present: bool| -> Option<&Value> {
         if !present {
             return None;
         }
-        let v = fields.get(vi).and_then(Value::as_num);
+        let v = fields.get(vi);
         vi += 1;
         v
     };
-    if take_num(flags & font_flags::FAMILY != 0).is_some() {
-        // имя шрифта не используется: рендер идёт встроенным шрифтом
+    if let Some(name) = take(flags & font_flags::FAMILY != 0).and_then(Value::as_str) {
+        font.family = FontFamily::from_name(name);
     }
+    let mut take_num = |present: bool| take(present).and_then(Value::as_num);
     if let Some(h) = take_num(flags & font_flags::HEIGHT != 0) {
         if h > 0 {
             font.size_tenth_pt = h as u32;
@@ -856,6 +1211,47 @@ fn find_picture_table(root: &[Value], start: usize) -> Option<Vec<Vec<u8>>> {
     None
 }
 
+/// Область печати: `{тип, лево, верх, право, низ, GUID}`; тип 0 — область не
+/// задана, отрицательная граница — граница не ограничена. Возвращает `None`,
+/// если объект не той формы, и `Some(None)` для незаданной области.
+fn print_area_from_value(v: &Value) -> Option<Option<PrintArea>> {
+    let fields = v.as_list()?;
+    if fields.len() != 6 {
+        return None;
+    }
+    let guid = match &fields[5] {
+        Value::Atom(a) => a,
+        _ => return None,
+    };
+    if guid.len() != 36 || guid.matches('-').count() != 4 {
+        return None;
+    }
+    let kind = fields[0].as_num()?;
+    let mut nums = [0i64; 4];
+    for (dst, src) in nums.iter_mut().zip(&fields[1..5]) {
+        *dst = src.as_num()?;
+    }
+    if !(0..=3).contains(&kind) {
+        return None;
+    }
+    if kind == 0 {
+        return Some(None);
+    }
+    let bound = |n: i64| u32::try_from(n).ok();
+    let [l, t, r, b] = nums.map(bound);
+    if matches!((l, r), (Some(l), Some(r)) if r < l)
+        || matches!((t, b), (Some(t), Some(b)) if b < t)
+    {
+        return Some(None);
+    }
+    Some(Some(PrintArea {
+        left: l,
+        top: t,
+        right: r,
+        bottom: b,
+    }))
+}
+
 /// Объединения: объект вида `{n, {л,в,п,н,флаг} × n}`; берём записи с флагом 0.
 fn merges_from_value(v: &Value) -> Option<Vec<Merge>> {
     let fields = v.as_list()?;
@@ -874,7 +1270,15 @@ fn merges_from_value(v: &Value) -> Option<Vec<Merge>> {
             *dst = src.as_num()?;
         }
         let [l, t, r, b, flag] = nums;
-        if flag != 0 || l < 0 || t < 0 || r < l || b < t {
+        // r и b не меньше l и t, поэтому достаточно проверить их предел
+        if flag != 0
+            || l < 0
+            || t < 0
+            || r < l
+            || b < t
+            || r > u32::MAX as i64
+            || b > u32::MAX as i64
+        {
             continue;
         }
         merges.push(Merge {
@@ -1016,9 +1420,20 @@ fn parse_tail(root: &[Value], rows_end: usize, doc: &mut Document) {
             break;
         }
     }
+    // параметры печати: запись {{0, N, ключ, значение…}} в хвосте
+    if let Some(setup) = root.iter().skip(i).find_map(page_setup_from_value) {
+        doc.page_setup = setup;
+    }
+    // область печати: первый объект вида {тип, л, в, п, н, GUID} в хвосте
+    doc.print_area = root
+        .iter()
+        .skip(i)
+        .find_map(print_area_from_value)
+        .flatten();
     if let Some((formats, fonts, fonts_end)) = find_format_and_font_tables(root, i) {
         doc.formats = formats;
         doc.fonts = fonts;
+        doc.number_formats = number_formats_from(root, fonts_end);
         // таблица цветов идёт после таблицы шрифтов (через таблицу числовых
         // форматов и пару служебных полей)
         if let Some((colors, colors_end)) = find_color_table(root, fonts_end) {
@@ -1039,7 +1454,12 @@ fn parse_tail(root: &[Value], rows_end: usize, doc: &mut Document) {
 
 /// Предел размера входного файла: файл читается в память целиком, и дерево
 /// значений занимает кратно больше самого файла.
+#[cfg(target_pointer_width = "64")]
 pub const MAX_FILE_SIZE: u64 = 200 * 1024 * 1024;
+/// В 32-битном процессе дерево значений файла в 200 МБ (в разы больше самого
+/// файла) не помещается в адресное пространство.
+#[cfg(not(target_pointer_width = "64"))]
+pub const MAX_FILE_SIZE: u64 = 40 * 1024 * 1024;
 
 /// Читает и разбирает файл *.mxl (формат 1С 8.х).
 pub fn parse_file(path: &Path) -> Result<Document, MxlError> {
@@ -1056,6 +1476,33 @@ pub fn parse_file(path: &Path) -> Result<Document, MxlError> {
     let data = std::fs::read(path)
         .map_err(|e| MxlError(format!("не удалось прочитать файл {}: {e}", path.display())))?;
     parse_bytes(&data)
+}
+
+/// Текст ячеек со значением: представление значения по форматной строке
+/// формата ячейки (или строки).
+pub fn fill_value_texts(doc: &mut Document) {
+    let formats = &doc.formats;
+    let format_of = |index: u32| -> Option<u32> {
+        if index == 0 {
+            return None;
+        }
+        formats.get(index as usize - 1)?.number_format
+    };
+    for row in &mut doc.rows {
+        let row_format = format_of(row.format);
+        for (_, cell) in &mut row.cells {
+            if cell.text.is_some() {
+                continue;
+            }
+            let Some(value) = &cell.value else { continue };
+            let pattern = format_of(cell.format)
+                .or(row_format)
+                .and_then(|i| doc.number_formats.get(i as usize))
+                .map(String::as_str)
+                .unwrap_or("");
+            cell.text = Some(format_value(value, pattern));
+        }
+    }
 }
 
 /// Разбирает содержимое файла *.mxl.
@@ -1092,6 +1539,7 @@ pub fn parse_bytes(data: &[u8]) -> Result<Document, MxlError> {
         ..Document::default()
     };
     parse_tail(root, rows_end, &mut doc);
+    fill_value_texts(&mut doc);
     Ok(doc)
 }
 
@@ -1349,5 +1797,121 @@ mod tests {
         assert_eq!(doc.format(col1_fmt_idx).unwrap().width, Some(64));
         // объединения найдены
         assert!(!doc.merges.is_empty());
+    }
+
+    fn demo(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../mxl-demo-collection")
+            .join(name)
+    }
+
+    #[test]
+    fn font_family_by_name() {
+        for (name, family) in [
+            ("Arial", FontFamily::Sans),
+            ("Tahoma", FontFamily::Sans),
+            ("Microsoft Sans Serif", FontFamily::Sans),
+            ("Times New Roman", FontFamily::Serif),
+            ("Georgia", FontFamily::Serif),
+            ("PT Serif", FontFamily::Serif),
+            ("Courier New", FontFamily::Mono),
+            ("Consolas", FontFamily::Mono),
+            ("Lucida Console", FontFamily::Mono),
+        ] {
+            assert_eq!(FontFamily::from_name(name), family, "{name}");
+        }
+    }
+
+    #[test]
+    fn parses_print_area_page_breaks_and_font_names() {
+        let doc = parse_file(&demo("ДемонстрацияПечатиРазрывов_A4_Книжная.mxl")).unwrap();
+        // ОбластьПечати R1C1:R49C12
+        assert_eq!(
+            doc.print_area,
+            Some(PrintArea {
+                left: Some(0),
+                top: Some(0),
+                right: Some(11),
+                bottom: Some(48),
+            })
+        );
+        // разрывы после строк 25 и 36 и после колонки 12 (1-базные)
+        assert_eq!(doc.row_breaks(), vec![24, 35]);
+        assert_eq!(doc.column_breaks(), vec![11]);
+        // шрифт Consolas в таблице шрифтов — моноширинное семейство
+        assert!(doc.fonts.iter().any(|f| f.family == FontFamily::Mono));
+        assert!(doc.fonts.iter().any(|f| f.family == FontFamily::Sans));
+    }
+
+    #[test]
+    fn documents_without_print_area_or_breaks() {
+        let doc = parse_file(&demo("ДемонстрацияГраницОбъединений.mxl")).unwrap();
+        assert_eq!(doc.print_area, None);
+        assert!(doc.row_breaks().is_empty());
+        assert!(doc.column_breaks().is_empty());
+    }
+
+    #[test]
+    fn print_area_shapes() {
+        let guid = || Value::Atom("00000000-0000-0000-0000-000000000000".to_string());
+        let area = |items: [i64; 5]| {
+            let mut v: Vec<Value> = items.iter().map(|&n| Value::Num(n)).collect();
+            v.push(guid());
+            print_area_from_value(&Value::List(v))
+        };
+        assert_eq!(area([0, -1, -1, -1, -1]), Some(None));
+        assert_eq!(
+            area([1, -1, 2, -1, 5]),
+            Some(Some(PrintArea {
+                left: None,
+                top: Some(2),
+                right: None,
+                bottom: Some(5),
+            }))
+        );
+        assert_eq!(area([3, 5, 0, 2, 0]), Some(None), "перевёрнутая область");
+        assert_eq!(area([9, 0, 0, 1, 1]), None, "неизвестный тип");
+        assert_eq!(print_area_from_value(&Value::Num(3)), None);
+    }
+
+    #[test]
+    fn parses_page_setup_of_printing_demos() {
+        let a4 = parse_file(&demo("ДемонстрацияПечатиРазрывов_A4_Книжная.mxl")).unwrap();
+        let s = &a4.page_setup;
+        assert_eq!(s.paper.as_deref(), Some("A4"));
+        assert!(!s.landscape && !s.auto_scale && s.black_and_white);
+        assert_eq!(s.scale, 85);
+        assert_eq!(s.margins_mm, [10.0, 12.0, 10.0, 12.0]);
+        assert_eq!(s.paper_size_mm(), (210.0, 297.0));
+        assert_eq!(s.printable_mm(), (186.0, 277.0));
+
+        let landscape = parse_file(&demo("ДемонстрацияПечатиРазрывов_A4_Альбомная.mxl")).unwrap();
+        assert!(landscape.page_setup.landscape);
+        assert_eq!(landscape.page_setup.paper_size_mm(), (297.0, 210.0));
+
+        // у A3 в ключах 16/17 записано 210×297, размер берётся из имени
+        let a3 = parse_file(&demo("ДемонстрацияПечатиРазрывов_A3_Книжная.mxl")).unwrap();
+        assert_eq!(a3.page_setup.custom_size_mm, Some((210.0, 297.0)));
+        assert_eq!(a3.page_setup.paper_size_mm(), (297.0, 420.0));
+    }
+
+    #[test]
+    fn page_setup_defaults_and_unknown_paper() {
+        let doc = parse_file(&demo("ДемонстрацияГраницОбъединений.mxl")).unwrap();
+        assert_eq!(doc.page_setup.paper, None);
+        assert_eq!(doc.page_setup.scale, 100);
+        assert_eq!(doc.page_setup.paper_size_mm(), (210.0, 297.0));
+        let custom = PageSetup {
+            paper: Some("Нестандартный".into()),
+            custom_size_mm: Some((100.0, 150.0)),
+            landscape: true,
+            ..PageSetup::default()
+        };
+        assert_eq!(custom.paper_size_mm(), (150.0, 100.0));
+        let letter = PageSetup {
+            paper: Some("letter".into()),
+            ..PageSetup::default()
+        };
+        assert_eq!(letter.paper_size_mm(), (215.9, 279.4));
     }
 }

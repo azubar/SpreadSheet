@@ -9,6 +9,8 @@
 *.jpeg
 *.png
 !docs/**/*.png
+# эталонные картинки регрессионных тестов
+!spreadsheet/tests/golden/*.png
 
 # Службові файли редакторів та ОС
 .idea/

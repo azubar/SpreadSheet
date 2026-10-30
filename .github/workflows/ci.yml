@@ -17,15 +17,27 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # версия — как в rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.1"
           components: clippy, rustfmt
+          targets: ${{ matrix.os == 'windows-latest' && 'i686-pc-windows-msvc' || '' }}
       - uses: Swatinem/rust-cache@v2
+      - name: poppler-utils (PDF-тести на Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils
       - name: Форматування
         run: cargo fmt --check -p spreadsheet
       - name: Тести
         run: cargo test -p spreadsheet
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy x86 (32-біт)
+        if: runner.os == 'Windows'
+        run: cargo clippy -p spreadsheet --all-targets --target i686-pc-windows-msvc -- -D warnings
       - name: Збірка release
         run: cargo build -p spreadsheet --release
+      - name: Збірка release x86 (32-біт)
+        if: runner.os == 'Windows'
+        run: cargo build -p spreadsheet --release --target i686-pc-windows-msvc

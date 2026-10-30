@@ -61,7 +61,7 @@ fn main() {
 
         // Convert PNG
         let png_path = out_dir.join(format!("{}.png", stem));
-        let png_res = convert(&doc, &png_path, &ImageKind::Png, 100);
+        let png_res = convert(&doc, &png_path, &ImageKind::PNG, 100);
         match png_res {
             Ok(()) => {
                 ok += 1;

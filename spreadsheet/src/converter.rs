@@ -6,21 +6,42 @@
 //! рендера — 96 DPI, т.е. 1 единица ширины = 7/8 px, 1 единица высоты = 1/3 px;
 //! свойство «Масштаб» умножает обе величины.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io::BufWriter;
+use std::io::Write;
 use std::path::Path;
+use std::rc::Rc;
 
-use ab_glyph::{Font, FontRef, ScaleFont};
+use ab_glyph::{Font, FontRef, GlyphId, PxScaleFont, ScaleFont};
 use tiny_skia::{Paint, Pixmap, Rect, Transform};
 
-use crate::mxl_parser::{Cell, CellFormat, Document, DrawingKind, FontSpec, LineSpec, Merge};
+use crate::mxl_parser::{
+    Cell, CellFormat, Document, DrawingKind, FontFamily, FontSpec, LineSpec, Merge,
+};
 
-// Встроенные шрифты: Liberation Sans (лицензия SIL OFL, см. fonts/LICENSE) —
-// метрически совместим с Arial, которым набраны документы 1С.
-static FONT_REGULAR: &[u8] = include_bytes!("../fonts/LiberationSans-Regular.ttf");
-static FONT_BOLD: &[u8] = include_bytes!("../fonts/LiberationSans-Bold.ttf");
-static FONT_ITALIC: &[u8] = include_bytes!("../fonts/LiberationSans-Italic.ttf");
-static FONT_BOLD_ITALIC: &[u8] = include_bytes!("../fonts/LiberationSans-BoldItalic.ttf");
+// Встроенные шрифты Liberation (лицензия SIL OFL, см. fonts/LICENSE) —
+// метрически совместимы со шрифтами документов 1С: Sans — с Arial, Serif —
+// с Times New Roman, Mono — с Courier New. Порядок: семейство × (обычный,
+// жирный, курсив, жирный курсив), последним — запасной шрифт.
+static FONT_FILES: [&[u8]; 13] = [
+    include_bytes!("../fonts/LiberationSans-Regular.ttf"),
+    include_bytes!("../fonts/LiberationSans-Bold.ttf"),
+    include_bytes!("../fonts/LiberationSans-Italic.ttf"),
+    include_bytes!("../fonts/LiberationSans-BoldItalic.ttf"),
+    include_bytes!("../fonts/LiberationSerif-Regular.ttf"),
+    include_bytes!("../fonts/LiberationSerif-Bold.ttf"),
+    include_bytes!("../fonts/LiberationSerif-Italic.ttf"),
+    include_bytes!("../fonts/LiberationSerif-BoldItalic.ttf"),
+    include_bytes!("../fonts/LiberationMono-Regular.ttf"),
+    include_bytes!("../fonts/LiberationMono-Bold.ttf"),
+    include_bytes!("../fonts/LiberationMono-Italic.ttf"),
+    include_bytes!("../fonts/LiberationMono-BoldItalic.ttf"),
+    // DejaVu Sans (см. fonts/LICENSE-DejaVu) — для символов, которых нет в
+    // Liberation (стрелки, математические и прочие знаки)
+    include_bytes!("../fonts/DejaVuSans.ttf"),
+];
+/// Индекс запасного шрифта в [`FONT_FILES`].
+const FALLBACK_FACE: usize = 12;
 
 /// Ширина колонки по умолчанию, 1/8 символа (9 символов, как в 1С)
 const DEFAULT_COL_WIDTH_UNITS: f32 = 72.0;
@@ -35,15 +56,102 @@ const CELL_PAD_Y: f32 = 3.0;
 /// Предел размеров картинки по каждой стороне. 65 500 — предел большинства
 /// кодеков (в частности, JPEG не поддерживает сторону > 65 535). Длинные
 /// документы (например, прайс на тысячу строк) при этом отрисовываются.
-const MAX_DIMENSION: u32 = 65_500;
+pub const MAX_DIMENSION: u32 = 65_500;
+/// Предел площади картинки в пикселях. Буфер RGBA занимает 4 байта на
+/// пиксель, ещё 3 байта на пиксель нужны при кодировании, — 250 Мпикс это
+/// около 1,75 ГБ. Без этого предела картинка 65 500 × 65 500 потребовала бы
+/// ~30 ГБ, и нехватка памяти аварийно завершила бы процесс 1С целиком
+/// (`catch_unwind` такую ошибку не перехватывает).
+#[cfg(target_pointer_width = "64")]
+pub const MAX_PIXELS: u64 = 250_000_000;
+/// В 32-битном процессе (клиент 1С x86) всё адресное пространство — 2–4 ГБ,
+/// и непрерывный блок больше нескольких сотен МБ часто не выделить: 60 Мпикс
+/// — это ~420 МБ на буфер и кодирование (например, A4 при 600 DPI — 35 Мпикс).
+#[cfg(not(target_pointer_width = "64"))]
+pub const MAX_PIXELS: u64 = 60_000_000;
+/// Предел размера закодированной картинки по умолчанию (свойство
+/// «МаксимальныйРазмерКартинки»), байт.
+pub const DEFAULT_MAX_IMAGE_BYTES: usize = 50_000_000;
+/// Предел числа записей индекса объединений (см. [`MergeIndex`]): защита от
+/// документов с множеством огромных (в т.ч. перекрывающихся) объединений.
+const MAX_MERGE_INDEX_ENTRIES: usize = 10_000_000;
+
+/// Проверяет, что картинку заданного размера можно создать: каждая сторона
+/// не больше [`MAX_DIMENSION`], площадь не больше [`MAX_PIXELS`]. Вызывается
+/// до выделения памяти под буфер. `hint` — подсказка, что уменьшить.
+pub fn check_image_size(width: u64, height: u64, hint: &str) -> Result<(), String> {
+    if width > MAX_DIMENSION as u64 || height > MAX_DIMENSION as u64 {
+        return Err(format!(
+            "слишком большая картинка {width}x{height}px \
+             (предел стороны {MAX_DIMENSION}px) — {hint}"
+        ));
+    }
+    if width * height > MAX_PIXELS {
+        return Err(format!(
+            "слишком большая картинка {width}x{height}px ({} Мпикс, \
+             предел {} Мпикс) — {hint}",
+            width * height / 1_000_000,
+            MAX_PIXELS / 1_000_000
+        ));
+    }
+    Ok(())
+}
+
+/// Выделяет буфер ёмкостью `len` байт. Нехватка памяти возвращается ошибкой,
+/// а не завершает процесс 1С аварийно, как при обычном выделении (`vec!`,
+/// `Vec::with_capacity`).
+pub fn try_buffer(len: usize) -> Result<Vec<u8>, String> {
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(len).map_err(|_| {
+        format!(
+            "недостаточно памяти для буфера изображения ({} МБ) — уменьшите Масштаб",
+            len / 1_000_000
+        )
+    })?;
+    Ok(buffer)
+}
+
+/// Белая непрозрачная картинка `width × height` (память — через
+/// [`try_buffer`]).
+pub fn white_pixmap(width: u32, height: u32) -> Result<Pixmap, String> {
+    let size = tiny_skia::IntSize::from_wh(width, height)
+        .ok_or_else(|| format!("недопустимый размер картинки {width}x{height}px"))?;
+    let len = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| format!("слишком большая картинка {width}x{height}px"))?;
+    let mut data = try_buffer(len)?;
+    // белый в премультиплицированном RGBA — все байты 255
+    data.resize(len, 255);
+    Pixmap::from_vec(data, size).ok_or_else(|| "не удалось создать буфер изображения".to_string())
+}
+
+/// Степень сжатия PNG (свойство «СжатиеPNG»).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PngCompression {
+    /// Быстрое кодирование, файл крупнее
+    Fast,
+    /// Баланс скорости и размера
+    Default,
+    /// Наименьший файл, кодирование медленнее
+    Best,
+}
 
 #[derive(Debug, Clone)]
 pub enum ImageKind {
     Jpeg { quality: u8 },
-    Png,
+    Png { compression: PngCompression },
 }
 
-/// Полный конвейер: модель → картинка на диске.
+impl ImageKind {
+    /// PNG со сжатием по умолчанию.
+    pub const PNG: ImageKind = ImageKind::Png {
+        compression: PngCompression::Default,
+    };
+}
+
+/// Полный конвейер: модель → картинка на диске (предел размера файла —
+/// [`DEFAULT_MAX_IMAGE_BYTES`]).
 pub fn convert(
     doc: &Document,
     out_path: &Path,
@@ -51,13 +159,14 @@ pub fn convert(
     scale_percent: u32,
 ) -> Result<(), String> {
     let pixmap = render(doc, scale_percent)?;
-    encode(&pixmap, out_path, kind)
+    encode_to_file(&pixmap, out_path, kind, DEFAULT_MAX_IMAGE_BYTES)
 }
 
 // ---------------------------------------------------------------------------
 // Раскладка
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct Layout {
     /// x-границы колонок для каждой строки не нужны целиком: группы колонок
     /// различаются по строкам, поэтому храним x-границы по группам, а для
@@ -70,6 +179,8 @@ struct Layout {
     row_y: Vec<f32>,
     ncols: u32,
     width_px: u32,
+    /// Правая граница занятой содержимым области (по всем группам колонок)
+    content_right: f32,
     height_px: u32,
     scale: f32,
 }
@@ -92,31 +203,185 @@ impl Layout {
     }
 }
 
+/// Растр глифа, готовый к наложению: покрытие пикселей прямоугольника
+/// `w × h`, левый верхний угол которого смещён на `(min_x, min_y)` px от
+/// целой части позиции глифа.
+struct GlyphBitmap {
+    min_x: f32,
+    min_y: f32,
+    w: usize,
+    coverage: Vec<f32>,
+}
+
+/// Ключ кэша растров: начертание, глиф, размер и дробная часть позиции
+/// (растр зависит только от них — см. `ab_glyph::OutlinedGlyph::px_bounds`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct GlyphKey {
+    face: u8,
+    glyph: u16,
+    scale_x: u32,
+    scale_y: u32,
+    fract_x: u32,
+    fract_y: u32,
+}
+
+/// Предел числа растров в кэше (каждый — от сотен байт до десятков КБ).
+const GLYPH_CACHE_LIMIT: usize = 20_000;
+
 struct Fonts<'a> {
-    regular: FontRef<'a>,
-    bold: FontRef<'a>,
-    italic: FontRef<'a>,
-    bold_italic: FontRef<'a>,
+    /// шрифты в порядке [`FONT_FILES`]
+    faces: Vec<FontRef<'a>>,
+    /// Кэш растров глифов: документ набран несколькими шрифтами и
+    /// размерами, поэтому одни и те же глифы растеризуются многократно.
+    glyphs: RefCell<HashMap<GlyphKey, Option<Rc<GlyphBitmap>>>>,
 }
 
 impl<'a> Fonts<'a> {
     fn load() -> Result<Fonts<'a>, String> {
         let load = |data| FontRef::try_from_slice(data).map_err(|e| format!("шрифт: {e}"));
         Ok(Fonts {
-            regular: load(FONT_REGULAR)?,
-            bold: load(FONT_BOLD)?,
-            italic: load(FONT_ITALIC)?,
-            bold_italic: load(FONT_BOLD_ITALIC)?,
+            faces: FONT_FILES
+                .iter()
+                .map(|data| load(data))
+                .collect::<Result<_, _>>()?,
+            glyphs: RefCell::new(HashMap::new()),
         })
     }
 
+    fn face_index(spec: &FontSpec) -> usize {
+        let family = match spec.family {
+            FontFamily::Sans => 0,
+            FontFamily::Serif => 4,
+            FontFamily::Mono => 8,
+        };
+        family
+            + match (spec.bold, spec.italic) {
+                (false, false) => 0,
+                (true, false) => 1,
+                (false, true) => 2,
+                (true, true) => 3,
+            }
+    }
+
     fn pick(&self, spec: &FontSpec) -> &FontRef<'a> {
-        match (spec.bold, spec.italic) {
-            (false, false) => &self.regular,
-            (true, false) => &self.bold,
-            (false, true) => &self.italic,
-            (true, true) => &self.bold_italic,
+        &self.faces[Self::face_index(spec)]
+    }
+
+    /// Шрифт нужного начертания в масштабе `px`.
+    fn scaled(&self, spec: &FontSpec, px: f32) -> ScaledFace<'_, 'a> {
+        ScaledFace {
+            face: Self::face_index(spec) as u8,
+            font: self.pick(spec).as_scaled(px),
+            fallback: self.faces[FALLBACK_FACE].as_scaled(px),
         }
+    }
+
+    /// Растр глифа `id` в позиции `(x, y)`. Возвращает растр и целую часть
+    /// позиции, к которой прибавляется смещение растра.
+    fn glyph_bitmap(
+        &self,
+        sf: &ScaledFace,
+        (fallback, id): FaceGlyph,
+        x: f32,
+        y: f32,
+    ) -> (Option<Rc<GlyphBitmap>>, f32, f32) {
+        let (trunc_x, fract_x) = (x.trunc(), x.fract());
+        let (trunc_y, fract_y) = (y.trunc(), y.fract());
+        let font = sf.font_of(fallback);
+        let scale = font.scale();
+        let key = GlyphKey {
+            face: if fallback {
+                FALLBACK_FACE as u8
+            } else {
+                sf.face
+            },
+            glyph: id.0,
+            scale_x: scale.x.to_bits(),
+            scale_y: scale.y.to_bits(),
+            fract_x: fract_x.to_bits(),
+            fract_y: fract_y.to_bits(),
+        };
+        if let Some(cached) = self.glyphs.borrow().get(&key) {
+            return (cached.clone(), trunc_x, trunc_y);
+        }
+        // Растеризация в позиции, равной дробной части: результат совпадает
+        // с растеризацией в исходной позиции со сдвигом на целую часть.
+        let glyph = id.with_scale_and_position(scale, ab_glyph::point(fract_x, fract_y));
+        let bitmap = font.font().outline_glyph(glyph).map(|outlined| {
+            let bounds = outlined.px_bounds();
+            let w = bounds.width() as usize;
+            let h = bounds.height() as usize;
+            let mut coverage = vec![0.0f32; w * h];
+            outlined.draw(|gx, gy, cov| {
+                coverage[gy as usize * w + gx as usize] = cov;
+            });
+            Rc::new(GlyphBitmap {
+                min_x: bounds.min.x,
+                min_y: bounds.min.y,
+                w,
+                coverage,
+            })
+        });
+        let mut cache = self.glyphs.borrow_mut();
+        if cache.len() >= GLYPH_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(key, bitmap.clone());
+        (bitmap, trunc_x, trunc_y)
+    }
+}
+
+/// Глиф с признаком «из запасного шрифта».
+type FaceGlyph = (bool, GlyphId);
+
+/// Шрифт конкретного начертания в конкретном масштабе (с запасным шрифтом
+/// того же размера). Метрики строки (`ascent`, `descent`) — основного шрифта.
+struct ScaledFace<'f, 'a> {
+    face: u8,
+    font: PxScaleFont<&'f FontRef<'a>>,
+    fallback: PxScaleFont<&'f FontRef<'a>>,
+}
+
+impl<'f, 'a> ScaledFace<'f, 'a> {
+    /// Глиф символа: из основного шрифта, а если там его нет — из запасного.
+    fn glyph(&self, ch: char) -> FaceGlyph {
+        let id = self.font.glyph_id(ch);
+        if id.0 == 0 && !ch.is_whitespace() {
+            let fid = self.fallback.glyph_id(ch);
+            if fid.0 != 0 {
+                return (true, fid);
+            }
+        }
+        (false, id)
+    }
+
+    fn font_of(&self, fallback: bool) -> &PxScaleFont<&'f FontRef<'a>> {
+        if fallback {
+            &self.fallback
+        } else {
+            &self.font
+        }
+    }
+
+    /// Кернинг пары глифов (только внутри одного шрифта).
+    fn kern(&self, prev: FaceGlyph, next: FaceGlyph) -> f32 {
+        if prev.0 == next.0 {
+            self.font_of(next.0).kern(prev.1, next.1)
+        } else {
+            0.0
+        }
+    }
+
+    fn h_advance(&self, g: FaceGlyph) -> f32 {
+        self.font_of(g.0).h_advance(g.1)
+    }
+}
+
+impl<'f, 'a> std::ops::Deref for ScaledFace<'f, 'a> {
+    type Target = PxScaleFont<&'f FontRef<'a>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.font
     }
 }
 
@@ -131,10 +396,13 @@ fn line_height(fonts: &Fonts, spec: &FontSpec, scale: f32) -> f32 {
     f.ascent() - f.descent()
 }
 
-fn text_width(fonts: &Fonts, spec: &FontSpec, scale: f32, text: &str) -> f32 {
-    let f = fonts.pick(spec).as_scaled(font_px(spec, scale));
-    let mut w = 0.0;
-    let mut prev = None;
+/// Состояние измерения строки: ширина и последний глиф (для кернинга).
+type Measure = (f32, Option<FaceGlyph>);
+
+/// Продолжает измерение ширины строки с состояния `state` на `text`.
+/// Измерение строки целиком и по частям даёт одинаковый результат.
+fn measure_more(f: &ScaledFace, state: Measure, text: &str) -> Measure {
+    let (mut w, mut prev) = state;
     for ch in text.chars() {
         // управляющие символы (табуляция, возврат каретки и пр.) не имеют
         // глифа — иначе они рисуются «квадратом .notdef»
@@ -142,47 +410,165 @@ fn text_width(fonts: &Fonts, spec: &FontSpec, scale: f32, text: &str) -> f32 {
             prev = None;
             continue;
         }
-        let id = f.glyph_id(ch);
+        let g = f.glyph(ch);
         if let Some(p) = prev {
-            w += f.kern(p, id);
+            w += f.kern(p, g);
         }
-        w += f.h_advance(id);
-        prev = Some(id);
+        w += f.h_advance(g);
+        prev = Some(g);
     }
-    w
+    (w, prev)
 }
 
-/// Перенос текста по словам под заданную ширину.
+fn text_width(fonts: &Fonts, spec: &FontSpec, scale: f32, text: &str) -> f32 {
+    let f = fonts.scaled(spec, font_px(spec, scale));
+    measure_more(&f, (0.0, None), text).0
+}
+
+/// Перенос текста по словам под заданную ширину. Ширина строки-кандидата
+/// наращивается по словам, а не пересчитывается целиком (линейное время).
 fn wrap_text(fonts: &Fonts, spec: &FontSpec, scale: f32, text: &str, max_w: f32) -> Vec<String> {
-    let mut lines = Vec::new();
+    wrap_text_paragraphs(fonts, spec, scale, text, max_w)
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect()
+}
+
+/// Перенос по словам с признаком «последняя строка абзаца» (для
+/// выравнивания по ширине: последняя строка абзаца не растягивается).
+fn wrap_text_paragraphs(
+    fonts: &Fonts,
+    spec: &FontSpec,
+    scale: f32,
+    text: &str,
+    max_w: f32,
+) -> Vec<(String, bool)> {
+    let f = fonts.scaled(spec, font_px(spec, scale));
+    let mut lines: Vec<(String, bool)> = Vec::new();
     for raw_line in text.split('\n') {
         let raw_line = raw_line.trim_end_matches('\r');
-        if text_width(fonts, spec, scale, raw_line) <= max_w {
-            lines.push(raw_line.to_string());
+        if measure_more(&f, (0.0, None), raw_line).0 <= max_w {
+            lines.push((raw_line.to_string(), true));
             continue;
         }
+        let paragraph_start = lines.len();
         let mut current = String::new();
+        let mut current_m: Measure = (0.0, None);
         for word in raw_line.split(' ') {
-            let candidate = if current.is_empty() {
-                word.to_string()
+            if current.is_empty() {
+                current.push_str(word);
+                current_m = measure_more(&f, (0.0, None), word);
+                continue;
+            }
+            let candidate_m = measure_more(&f, measure_more(&f, current_m, " "), word);
+            if candidate_m.0 <= max_w {
+                current.push(' ');
+                current.push_str(word);
+                current_m = candidate_m;
             } else {
-                format!("{current} {word}")
-            };
-            if text_width(fonts, spec, scale, &candidate) <= max_w || current.is_empty() {
-                current = candidate;
-            } else {
-                lines.push(std::mem::take(&mut current));
-                current = word.to_string();
+                lines.push((std::mem::take(&mut current), false));
+                current.push_str(word);
+                current_m = measure_more(&f, (0.0, None), word);
             }
         }
         if !current.is_empty() {
-            lines.push(current);
+            lines.push((current, false));
+        }
+        if let Some(last) = lines[paragraph_start..].last_mut() {
+            last.1 = true;
         }
     }
     if lines.is_empty() {
-        lines.push(String::new());
+        lines.push((String::new(), true));
     }
     lines
+}
+
+/// Индекс объединений: для каждой строки документа — отрезки колонок
+/// `(левая, правая, индекс объединения)`, упорядоченные по левой колонке.
+///
+/// Хранятся только строки, в которых есть ячейки (запросы бывают только к
+/// ним), поэтому размер индекса не зависит от площади объединений: прежняя
+/// карта «ячейка → объединение» для объединения 100 000 × 100 000 из
+/// повреждённого файла заняла бы 10¹⁰ записей.
+struct MergeIndex {
+    rows: HashMap<u32, Vec<(u32, u32, usize)>>,
+}
+
+impl MergeIndex {
+    fn new(doc: &Document) -> Result<MergeIndex, String> {
+        let mut row_indices: Vec<u32> = doc.rows.iter().map(|r| r.index).collect();
+        row_indices.sort_unstable();
+        row_indices.dedup();
+        let span = |m: &Merge| {
+            let a = row_indices.partition_point(|&r| r < m.top);
+            let b = row_indices.partition_point(|&r| r <= m.bottom);
+            &row_indices[a..b]
+        };
+        let entries: usize = doc.merges.iter().map(|m| span(m).len()).sum();
+        if entries > MAX_MERGE_INDEX_ENTRIES {
+            return Err(format!(
+                "слишком сложная структура объединений ячеек ({entries} записей, \
+                 предел {MAX_MERGE_INDEX_ENTRIES}) — файл, вероятно, повреждён"
+            ));
+        }
+        let mut rows: HashMap<u32, Vec<(u32, u32, usize)>> = HashMap::new();
+        for (i, m) in doc.merges.iter().enumerate() {
+            for &r in span(m) {
+                rows.entry(r).or_default().push((m.left, m.right, i));
+            }
+        }
+        for spans in rows.values_mut() {
+            spans.sort_unstable();
+        }
+        Ok(MergeIndex { rows })
+    }
+
+    /// Индекс объединения, покрывающего ячейку (строка, колонка).
+    fn get(&self, &(row, col): &(u32, u32)) -> Option<&usize> {
+        let spans = self.rows.get(&row)?;
+        let k = spans.partition_point(|&(left, _, _)| left <= col);
+        let (_, right, i) = spans.get(k.checked_sub(1)?)?;
+        (col <= *right).then_some(i)
+    }
+
+    fn contains_key(&self, cell: &(u32, u32)) -> bool {
+        self.get(cell).is_some()
+    }
+}
+
+/// Данные документа, которые нужны на всех этапах рендера и вычисляются
+/// один раз: индекс объединений и эффективные форматы ячеек.
+struct Prepared {
+    merges: MergeIndex,
+    /// (формат строки, формат ячейки) → эффективный формат
+    formats: HashMap<(u32, u32), CellFormat>,
+    no_format: CellFormat,
+}
+
+impl Prepared {
+    fn new(doc: &Document) -> Result<Prepared, String> {
+        let mut formats = HashMap::new();
+        for row in &doc.rows {
+            for (_, cell) in &row.cells {
+                formats
+                    .entry((row.format, cell.format))
+                    .or_insert_with(|| effective_format(doc, row.format, cell));
+            }
+        }
+        Ok(Prepared {
+            merges: MergeIndex::new(doc)?,
+            formats,
+            no_format: CellFormat::default(),
+        })
+    }
+
+    /// Эффективный формат ячейки строки (см. [`effective_format`]).
+    fn format(&self, row_format: u32, cell: &Cell) -> &CellFormat {
+        self.formats
+            .get(&(row_format, cell.format))
+            .unwrap_or(&self.no_format)
+    }
 }
 
 /// Эффективный формат ячейки: собственный формат ячейки поверх формата строки
@@ -209,6 +595,7 @@ fn effective_format(doc: &Document, row_format: u32, cell: &Cell) -> CellFormat 
         pattern_color: top.pattern_color.or(base.pattern_color),
         text_control: top.text_control.or(base.text_control),
         orientation: top.orientation.or(base.orientation),
+        number_format: top.number_format.or(base.number_format),
     }
 }
 
@@ -249,6 +636,25 @@ fn is_vertical(fmt: &CellFormat) -> bool {
     fmt.orientation == Some(ORIENT_VERTICAL)
 }
 
+/// Угол поворота текста в градусах (против часовой стрелки) для углов,
+/// отличных от 0° и 90° (90° — отдельный путь вертикального текста).
+fn text_angle(fmt: &CellFormat) -> Option<f32> {
+    let tenths = fmt.orientation? % 3600;
+    if tenths == 0 || tenths == ORIENT_VERTICAL {
+        return None;
+    }
+    Some(tenths as f32 / 10.0)
+}
+
+/// Размер описывающего прямоугольника блока `w × h`, повёрнутого на `angle`°.
+fn rotated_size(w: f32, h: f32, angle: f32) -> (f32, f32) {
+    let (sin, cos) = angle.to_radians().sin_cos();
+    (
+        (w * cos).abs() + (h * sin).abs(),
+        (w * sin).abs() + (h * cos).abs(),
+    )
+}
+
 fn font_spec(doc: &Document, fmt: &CellFormat) -> FontSpec {
     fmt.font
         .and_then(|i| doc.fonts.get(i as usize))
@@ -256,28 +662,42 @@ fn font_spec(doc: &Document, fmt: &CellFormat) -> FontSpec {
         .unwrap_or_default()
 }
 
-fn build_layout(doc: &Document, fonts: &Fonts, scale: f32) -> Result<Layout, String> {
+fn build_layout(
+    doc: &Document,
+    fonts: &Fonts,
+    prep: &Prepared,
+    scale: f32,
+) -> Result<Layout, String> {
     // размер таблицы
-    let mut ncols: u32 = 1;
-    let mut nrows: u32 = 1;
-    for row in &doc.rows {
-        nrows = nrows.max(row.index + 1);
-        for (col, _) in &row.cells {
-            ncols = ncols.max(col + 1);
-        }
+    let (nrows, ncols) = table_size(doc);
+    // Каждая строка занимает не меньше 1 px, поэтому строк больше
+    // MAX_DIMENSION картинка вместить не может. Проверка — до раскладки:
+    // номер строки из повреждённого файла (например, 2·10⁹) иначе приводит
+    // к выделению гигабайтов памяти под границы строк и аварийному
+    // завершению процесса 1С.
+    if nrows > MAX_DIMENSION {
+        return Err(format!(
+            "слишком много строк: {nrows} (предел {MAX_DIMENSION}) — \
+             картинка такой высоты невозможна или файл повреждён"
+        ));
     }
-    for m in &doc.merges {
-        nrows = nrows.max(m.bottom + 1);
-        ncols = ncols.max(m.right + 1);
-    }
-    for (col, _) in &doc.default_group.columns {
-        ncols = ncols.max(col + 1);
+    if ncols > MAX_DIMENSION {
+        return Err(format!(
+            "слишком много колонок: {ncols} (предел {MAX_DIMENSION}) — \
+             картинка такой ширины невозможна или файл повреждён"
+        ));
     }
 
     // x-границы по группам колонок
     let groups: Vec<&crate::mxl_parser::ColumnGroup> = std::iter::once(&doc.default_group)
         .chain(doc.extra_groups.iter())
         .collect();
+    if groups.len().saturating_mul(ncols as usize + 1) > MAX_MERGE_INDEX_ENTRIES {
+        return Err(format!(
+            "слишком много групп колонок ({}) — файл, вероятно, повреждён",
+            groups.len()
+        ));
+    }
     let mut group_x = Vec::with_capacity(groups.len());
     for (gi, g) in groups.iter().enumerate() {
         let widths: HashMap<u32, u32> = g.columns.iter().copied().collect();
@@ -320,7 +740,7 @@ fn build_layout(doc: &Document, fonts: &Fonts, scale: f32) -> Result<Layout, Str
     }
 
     // объединения понадобятся для ширины переноса
-    let merge_of = merge_map(doc);
+    let merge_of = &prep.merges;
 
     // высоты строк
     let default_font = FontSpec::default();
@@ -359,10 +779,10 @@ fn build_layout(doc: &Document, fonts: &Fonts, scale: f32) -> Result<Layout, Str
                     let Some(text) = cell.text.as_deref().filter(|t| !t.trim().is_empty()) else {
                         continue;
                     };
-                    let fmt = effective_format(doc, row.format, cell);
-                    let spec = font_spec(doc, &fmt);
+                    let fmt = prep.format(row.format, cell);
+                    let spec = font_spec(doc, fmt);
                     let lh = line_height(fonts, &spec, scale);
-                    if is_vertical(&fmt) {
+                    if is_vertical(fmt) {
                         // вертикальный текст: высота должна вместить самую
                         // длинную строку текста
                         let widest = text
@@ -370,6 +790,18 @@ fn build_layout(doc: &Document, fonts: &Fonts, scale: f32) -> Result<Layout, Str
                             .map(|l| text_width(fonts, &spec, scale, l.trim_end_matches('\r')))
                             .fold(0.0f32, f32::max);
                         content_h = content_h.max(widest + CELL_PAD_Y * scale);
+                        continue;
+                    }
+                    if let Some(angle) = text_angle(fmt) {
+                        // повёрнутый текст: высота повёрнутого блока строк
+                        let lines: Vec<&str> =
+                            text.split('\n').map(|l| l.trim_end_matches('\r')).collect();
+                        let widest = lines
+                            .iter()
+                            .map(|l| text_width(fonts, &spec, scale, l))
+                            .fold(0.0f32, f32::max);
+                        let (_, h) = rotated_size(widest, lines.len() as f32 * lh, angle);
+                        content_h = content_h.max(h + CELL_PAD_Y * scale);
                         continue;
                     }
                     let mut lines = if fmt.text_control == Some(3) {
@@ -434,23 +866,15 @@ fn build_layout(doc: &Document, fonts: &Fonts, scale: f32) -> Result<Layout, Str
             .map(|xs| *xs.last().unwrap())
             .fold(0.0f32, f32::max);
     }
-    let width_px = content_right.ceil() as u32 + 2;
-    let height_px = *row_y.last().unwrap() as u32 + 2;
-    if width_px == 0 || height_px == 0 {
-        return Err("документ пуст — нечего рисовать".to_string());
-    }
-    if width_px > MAX_DIMENSION || height_px > MAX_DIMENSION {
-        return Err(format!(
-            "слишком большая картинка {width_px}x{height_px}px \
-             (предел стороны {MAX_DIMENSION}px) — уменьшите Масштаб"
-        ));
-    }
+    let width_px = (content_right.ceil() as u32).saturating_add(2);
+    let height_px = (*row_y.last().unwrap() as u32).saturating_add(2);
     Ok(Layout {
         group_x,
         row_group_idx,
         row_y,
         ncols,
         width_px,
+        content_right,
         height_px,
         scale,
     })
@@ -468,19 +892,6 @@ fn col_span_x(
     (xs[c], xs[c + 1])
 }
 
-/// (строка, колонка) → индекс объединения, покрывающего ячейку.
-fn merge_map(doc: &Document) -> HashMap<(u32, u32), usize> {
-    let mut map = HashMap::new();
-    for (i, m) in doc.merges.iter().enumerate() {
-        for r in m.top..=m.bottom {
-            for c in m.left..=m.right {
-                map.insert((r, c), i);
-            }
-        }
-    }
-    map
-}
-
 // ---------------------------------------------------------------------------
 // Рисование
 // ---------------------------------------------------------------------------
@@ -489,16 +900,410 @@ fn merge_map(doc: &Document) -> HashMap<(u32, u32), usize> {
 pub fn render(doc: &Document, scale_percent: u32) -> Result<Pixmap, String> {
     let scale = scale_percent as f32 / 100.0;
     let fonts = Fonts::load()?;
-    let layout = build_layout(doc, &fonts, scale)?;
-    let mut pixmap = Pixmap::new(layout.width_px, layout.height_px)
-        .ok_or_else(|| "не удалось создать буфер изображения".to_string())?;
-    pixmap.fill(tiny_skia::Color::WHITE);
+    let prep = Prepared::new(doc)?;
+    let layout = build_layout(doc, &fonts, &prep, scale)?;
+    check_image_size(
+        layout.width_px as u64,
+        layout.height_px as u64,
+        "уменьшите Масштаб или выберите одну страницу (НомерСтраницы)",
+    )?;
+    draw_layout(doc, &fonts, &prep, &layout)
+}
 
-    let merge_of = merge_map(doc);
-    draw_backgrounds(doc, &layout, &merge_of, &mut pixmap);
-    draw_borders(doc, &layout, &merge_of, &mut pixmap);
-    draw_texts(doc, &fonts, &layout, &merge_of, &mut pixmap);
-    draw_drawings(doc, &fonts, &layout, &mut pixmap);
+/// Страница документа: диапазоны строк и колонок (0-базные, включительно).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageRange {
+    pub rows: (u32, u32),
+    pub cols: (u32, u32),
+}
+
+/// Делит отрезок `[from, to]` на части после позиций `breaks`.
+fn split_by_breaks(from: u32, to: u32, breaks: &[u32]) -> Vec<(u32, u32)> {
+    let mut parts = Vec::new();
+    let mut start = from;
+    for &b in breaks {
+        if b >= start && b < to {
+            parts.push((start, b));
+            start = b + 1;
+        }
+    }
+    parts.push((start, to));
+    parts
+}
+
+/// Число строк и колонок таблицы (по ячейкам, объединениям и колонкам).
+fn table_size(doc: &Document) -> (u32, u32) {
+    let mut ncols: u32 = 1;
+    let mut nrows: u32 = 1;
+    for row in &doc.rows {
+        nrows = nrows.max(row.index.saturating_add(1));
+        for (col, _) in &row.cells {
+            ncols = ncols.max(col.saturating_add(1));
+        }
+    }
+    for m in &doc.merges {
+        nrows = nrows.max(m.bottom.saturating_add(1));
+        ncols = ncols.max(m.right.saturating_add(1));
+    }
+    for (col, _) in &doc.default_group.columns {
+        ncols = ncols.max(col.saturating_add(1));
+    }
+    (nrows, ncols)
+}
+
+/// Страницы документа для печати: область печати (а без неё — вся
+/// таблица), разделённая явными горизонтальными и вертикальными разрывами
+/// страниц. Порядок страниц — «сначала вниз, затем вправо». Автоматическое
+/// разбиение по размеру листа бумаги не выполняется.
+pub fn pages(doc: &Document) -> Vec<PageRange> {
+    // граница области за пределами таблицы ограничивается таблицей
+    let (top, bottom, left, right) = print_area_bounds(doc);
+    let row_parts = split_by_breaks(top, bottom, &doc.row_breaks());
+    let col_parts = split_by_breaks(left, right, &doc.column_breaks());
+    col_parts
+        .iter()
+        .flat_map(|&cols| row_parts.iter().map(move |&rows| PageRange { rows, cols }))
+        .collect()
+}
+
+/// Рендерит страницу `page_number` (с 1) документа (см. [`pages`]).
+/// Раскладка строится для всего документа, но рисуется только окно
+/// страницы: память нужна лишь под картинку страницы, а содержимое на
+/// границе страницы (объединения, выпущенный текст) обрезается так же, как
+/// при печати.
+pub fn render_page(doc: &Document, scale_percent: u32, page_number: u32) -> Result<Pixmap, String> {
+    let all = pages(doc);
+    let page = page_number
+        .checked_sub(1)
+        .and_then(|i| all.get(i as usize))
+        .ok_or_else(|| {
+            format!(
+                "запрошена страница {page_number}, но в документе всего {} стр.",
+                all.len()
+            )
+        })?;
+    let scale = scale_percent as f32 / 100.0;
+    let fonts = Fonts::load()?;
+    let prep = Prepared::new(doc)?;
+    let layout = build_layout(doc, &fonts, &prep, scale)?;
+    let last_col = all.iter().map(|p| p.cols.1).max().unwrap_or(0);
+    let (left, top, right, bottom) = page_window(&layout, page, last_col);
+    // поле 1 px слева/сверху и 2 px справа/снизу под рамки — как у всего
+    // документа
+    let (w, h) = (
+        (right - left + 3.0).ceil().max(1.0),
+        (bottom - top + 3.0).ceil().max(1.0),
+    );
+    check_image_size(w as u64, h as u64, "уменьшите Масштаб")?;
+    draw_window(
+        doc,
+        &fonts,
+        &prep,
+        &layout,
+        (left - 1.0, top - 1.0),
+        (w as u32, h as u32),
+    )
+}
+
+/// Прямоугольник страницы в координатах раскладки (без полей под рамки):
+/// (лево, верх, право, низ).
+///
+/// Границы колонок у разных групп различаются: страница охватывает колонки
+/// страницы во всех группах. Последняя по горизонтали страница
+/// ограничивается занятой содержимым шириной — как картинка всего
+/// документа (у группы по умолчанию колонки, заданные только в других
+/// группах, имеют ширину по умолчанию, и без этого справа оставалось бы
+/// пустое поле или, наоборот, обрезалось содержимое широких групп).
+fn page_window(layout: &Layout, page: &PageRange, last_col: u32) -> (f32, f32, f32, f32) {
+    let left = layout
+        .group_x
+        .iter()
+        .map(|xs| xs[page.cols.0 as usize])
+        .fold(f32::INFINITY, f32::min);
+    let mut right = layout
+        .group_x
+        .iter()
+        .map(|xs| xs[page.cols.1 as usize + 1])
+        .fold(0.0f32, f32::max);
+    if page.cols.1 == last_col {
+        right = right.min(layout.content_right).max(left);
+    }
+    let top = layout.row_y[page.rows.0 as usize];
+    let bottom = layout.row_y[page.rows.1 as usize + 1];
+    (left, top, right, bottom)
+}
+
+/// Рисует окно раскладки с левым верхним углом `origin` размером `size`.
+/// Память — только под окно; содержимое за его границами отсекается.
+fn draw_window(
+    doc: &Document,
+    fonts: &Fonts,
+    prep: &Prepared,
+    layout: &Layout,
+    origin: (f32, f32),
+    size: (u32, u32),
+) -> Result<Pixmap, String> {
+    let mut window = layout.clone();
+    for xs in &mut window.group_x {
+        for x in xs.iter_mut() {
+            *x -= origin.0;
+        }
+    }
+    for y in &mut window.row_y {
+        *y -= origin.1;
+    }
+    window.content_right -= origin.0;
+    window.width_px = size.0;
+    window.height_px = size.1;
+    draw_layout(doc, fonts, prep, &window)
+}
+
+// ---------------------------------------------------------------------------
+// Печать «как на бумаге»
+// ---------------------------------------------------------------------------
+
+/// Границы области печати (верх, низ, лево, право), ограниченные таблицей.
+fn print_area_bounds(doc: &Document) -> (u32, u32, u32, u32) {
+    let (nrows, ncols) = table_size(doc);
+    let area = doc.print_area.unwrap_or_default();
+    let top = area.top.unwrap_or(0).min(nrows - 1);
+    let bottom = area.bottom.unwrap_or(nrows - 1).min(nrows - 1).max(top);
+    let left = area.left.unwrap_or(0).min(ncols - 1);
+    let right = area.right.unwrap_or(ncols - 1).min(ncols - 1).max(left);
+    (top, bottom, left, right)
+}
+
+/// Делит элементы `[from, to]` (строки или колонки с границами `bounds`:
+/// элемент `i` занимает `bounds[i]..bounds[i + 1]`) на страницы длиной не
+/// больше `limit`, с принудительными разрывами после элементов `breaks`.
+/// Элемент длиннее страницы занимает отдельную страницу целиком.
+fn paginate(bounds: &[f32], from: u32, to: u32, limit: f32, breaks: &[u32]) -> Vec<(u32, u32)> {
+    let mut parts = Vec::new();
+    let mut start = from;
+    for i in from..=to {
+        if i > start && bounds[i as usize + 1] - bounds[start as usize] > limit {
+            parts.push((start, i - 1));
+            start = i;
+        }
+        if i < to && breaks.binary_search(&i).is_ok() {
+            parts.push((start, i));
+            start = i + 1;
+        }
+    }
+    if start <= to {
+        parts.push((start, to));
+    }
+    parts
+}
+
+/// Миллиметры → пиксели при разрешении `dpi`.
+fn mm_to_px(mm: f64, dpi: u32) -> f32 {
+    (mm / 25.4 * dpi as f64) as f32
+}
+
+/// Задание печати документа «как на бумаге»: раскладка в масштабе печати,
+/// страницы и геометрия листа. Каждая страница выводится картинкой листа
+/// (формат, ориентация, поля — из параметров печати документа) при
+/// разрешении `dpi`.
+///
+/// Масштаб: «МасштабПечати» документа, а при «Автомасштаб» — вписывание
+/// области печати по ширине листа (только уменьшение). Страницы: область
+/// печати, разделённая явными разрывами и по размеру листа; порядок —
+/// «сначала вниз, затем вправо». Колонтитулы и повтор строк при печати не
+/// выводятся (их хранение в MXL пока не разобрано).
+pub struct PrintJob {
+    fonts: Fonts<'static>,
+    prep: Prepared,
+    layout: Layout,
+    pages: Vec<PageRange>,
+    last_col: u32,
+    paper_px: (u32, u32),
+    origin_px: (f32, f32),
+    printable_px: (f32, f32),
+    grayscale: bool,
+    scale: f32,
+}
+
+impl PrintJob {
+    pub fn new(doc: &Document, dpi: u32) -> Result<PrintJob, String> {
+        let setup = &doc.page_setup;
+        let fonts = Fonts::load()?;
+        let prep = Prepared::new(doc)?;
+        let (paper_w, paper_h) = setup.paper_size_mm();
+        let (avail_w, avail_h) = setup.printable_mm();
+        let paper_px = (
+            mm_to_px(paper_w, dpi).round().max(1.0) as u32,
+            mm_to_px(paper_h, dpi).round().max(1.0) as u32,
+        );
+        check_image_size(
+            paper_px.0 as u64,
+            paper_px.1 as u64,
+            "уменьшите РазрешениеПечати",
+        )?;
+        let (top, bottom, left, right) = print_area_bounds(doc);
+
+        let mut print_scale = setup.scale as f32 / 100.0;
+        if setup.auto_scale {
+            // ширина области печати при 100% (px при 96 DPI)
+            let base = build_layout(doc, &fonts, &prep, 1.0)?;
+            let (x0, _, x1, _) = page_window(
+                &base,
+                &PageRange {
+                    rows: (top, bottom),
+                    cols: (left, right),
+                },
+                right,
+            );
+            let width = (x1 - x0).max(1.0);
+            print_scale = (mm_to_px(avail_w, 96) / width).min(1.0);
+        }
+        let scale = print_scale * dpi as f32 / 96.0;
+        let layout = build_layout(doc, &fonts, &prep, scale)?;
+        let printable_px = (mm_to_px(avail_w, dpi), mm_to_px(avail_h, dpi));
+
+        // правая граница колонок: последняя колонка, начинающаяся левее
+        // занятой содержимым ширины (колонки-«хвосты» группы по умолчанию
+        // не дают пустых страниц справа)
+        let col_starts: Vec<f32> = (0..layout.group_x[0].len())
+            .map(|i| {
+                layout
+                    .group_x
+                    .iter()
+                    .map(|xs| xs[i])
+                    .fold(f32::INFINITY, f32::min)
+            })
+            .collect();
+        let right = (left..=right)
+            .rev()
+            .find(|&c| col_starts[c as usize] < layout.content_right)
+            .unwrap_or(left);
+        let col_bounds: Vec<f32> = (0..layout.group_x[0].len())
+            .map(|i| layout.group_x.iter().map(|xs| xs[i]).fold(0.0f32, f32::max))
+            .collect();
+        let row_parts = paginate(
+            &layout.row_y,
+            top,
+            bottom,
+            printable_px.1,
+            &doc.row_breaks(),
+        );
+        let col_parts = paginate(
+            &col_bounds,
+            left,
+            right,
+            printable_px.0,
+            &doc.column_breaks(),
+        );
+        let pages: Vec<PageRange> = col_parts
+            .iter()
+            .flat_map(|&cols| row_parts.iter().map(move |&rows| PageRange { rows, cols }))
+            .collect();
+        let [margin_top, margin_left, _, _] = setup.margins_mm;
+        Ok(PrintJob {
+            fonts,
+            prep,
+            pages,
+            last_col: right,
+            paper_px,
+            origin_px: (mm_to_px(margin_left, dpi), mm_to_px(margin_top, dpi)),
+            printable_px,
+            grayscale: setup.black_and_white,
+            scale: print_scale,
+            layout,
+        })
+    }
+
+    /// Число страниц.
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Размер листа, px.
+    pub fn paper_size_px(&self) -> (u32, u32) {
+        self.paper_px
+    }
+
+    /// Итоговый масштаб печати (1.0 = 100%): «МасштабПечати» или результат
+    /// автомасштаба.
+    pub fn print_scale(&self) -> f32 {
+        self.scale
+    }
+
+    /// Рендерит страницу `page_number` (с 1) картинкой листа.
+    pub fn render(&self, doc: &Document, page_number: u32) -> Result<Pixmap, String> {
+        let page = page_number
+            .checked_sub(1)
+            .and_then(|i| self.pages.get(i as usize))
+            .ok_or_else(|| {
+                format!(
+                    "запрошена страница {page_number}, но при печати в документе {} стр.",
+                    self.pages.len()
+                )
+            })?;
+        let (left, top, right, bottom) = page_window(&self.layout, page, self.last_col);
+        // содержимое шире или выше области печати (одна строка выше листа)
+        // обрезается по области печати
+        let right = right.min(left + self.printable_px.0);
+        let bottom = bottom.min(top + self.printable_px.1);
+        let size = (
+            (right - left + 3.0).ceil().max(1.0) as u32,
+            (bottom - top + 3.0).ceil().max(1.0) as u32,
+        );
+        let content = draw_window(
+            doc,
+            &self.fonts,
+            &self.prep,
+            &self.layout,
+            (left - 1.0, top - 1.0),
+            size,
+        )?;
+        let mut paper = white_pixmap(self.paper_px.0, self.paper_px.1)?;
+        copy_pixmap(
+            &mut paper,
+            &content,
+            (self.origin_px.0 - 1.0).round().max(0.0) as u32,
+            (self.origin_px.1 - 1.0).round().max(0.0) as u32,
+        );
+        if self.grayscale {
+            to_grayscale(&mut paper);
+        }
+        Ok(paper)
+    }
+}
+
+/// Переводит картинку в оттенки серого (яркость по ITU-R BT.601).
+pub fn to_grayscale(pixmap: &mut Pixmap) {
+    for p in pixmap.data_mut().as_chunks_mut::<4>().0.iter_mut() {
+        let y = (p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114 + 500) / 1000;
+        p[0] = y as u8;
+        p[1] = y as u8;
+        p[2] = y as u8;
+    }
+}
+
+/// Проверяет, что картинка в оттенках серого (R = G = B во всех пикселях).
+pub fn is_grayscale(pixmap: &Pixmap) -> bool {
+    pixmap
+        .data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .all(|p| p[0] == p[1] && p[1] == p[2])
+}
+
+/// Рисует документ по готовой раскладке в буфер размера раскладки.
+fn draw_layout(
+    doc: &Document,
+    fonts: &Fonts,
+    prep: &Prepared,
+    layout: &Layout,
+) -> Result<Pixmap, String> {
+    let mut pixmap = white_pixmap(layout.width_px, layout.height_px)?;
+
+    draw_backgrounds(doc, layout, prep, &mut pixmap);
+    draw_borders(doc, layout, prep, &mut pixmap);
+    draw_texts(doc, fonts, layout, prep, &mut pixmap);
+    draw_drawings(doc, fonts, layout, &mut pixmap);
     Ok(pixmap)
 }
 
@@ -573,7 +1378,7 @@ fn draw_drawings(doc: &Document, fonts: &Fonts, layout: &Layout, pixmap: &mut Pi
                 fill_rect(pixmap, x0, y0, t, y1 - y0, border_color);
                 fill_rect(pixmap, x1 - t, y0, t, y1 - y0, border_color);
                 if d.kind == DrawingKind::Text {
-                    let scaled = fonts.pick(&spec).as_scaled(font_px(&spec, scale));
+                    let scaled = fonts.scaled(&spec, font_px(&spec, scale));
                     let color = fmt
                         .text_color
                         .and_then(|i| doc.color_rgb(i))
@@ -586,6 +1391,7 @@ fn draw_drawings(doc: &Document, fonts: &Fonts, layout: &Layout, pixmap: &mut Pi
                         }
                         draw_line_of_text(
                             pixmap,
+                            fonts,
                             &scaled,
                             line,
                             x0 + pad,
@@ -601,35 +1407,71 @@ fn draw_drawings(doc: &Document, fonts: &Fonts, layout: &Layout, pixmap: &mut Pi
     }
 }
 
-/// Копирует растровую картинку в прямоугольник (грубое масштабирование
-/// по ближайшему пикселю, альфа-смешивание).
+/// Вписывает растровую картинку в прямоугольник с альфа-смешиванием.
+/// Масштабирование — с фильтрацией: при уменьшении треугольный фильтр
+/// (без «лестницы» и потери тонких линий печатей и логотипов), при
+/// увеличении — Catmull-Rom (без «квадратиков» ближайшего соседа).
 fn blit_image(pixmap: &mut Pixmap, rgba: &image::RgbaImage, x0: f32, y0: f32, x1: f32, y1: f32) {
-    let width = pixmap.width() as i32;
-    let height = pixmap.height() as i32;
     let (tw, th) = (x1 - x0, y1 - y0);
-    if tw < 1.0 || th < 1.0 {
+    if tw < 1.0 || th < 1.0 || rgba.width() == 0 || rgba.height() == 0 {
         return;
     }
+    let (w, h) = (tw.round() as u32, th.round() as u32);
+    // картинка много больше листа (повреждённые смещения) — не рисуем:
+    // масштабирование заняло бы непропорционально много памяти и времени
+    let page_area = pixmap.width() as u64 * pixmap.height() as u64;
+    if w as u64 * h as u64 > (4 * page_area).min(MAX_PIXELS) {
+        return;
+    }
+    let scaled;
+    let src = if (w, h) == rgba.dimensions() {
+        rgba
+    } else {
+        let filter = if w < rgba.width() || h < rgba.height() {
+            image::imageops::FilterType::Triangle
+        } else {
+            image::imageops::FilterType::CatmullRom
+        };
+        scaled = image::imageops::resize(rgba, w, h, filter);
+        &scaled
+    };
+    let width = pixmap.width() as i32;
+    let height = pixmap.height() as i32;
+    let (ox, oy) = (x0.round() as i32, y0.round() as i32);
     let data = pixmap.data_mut();
-    let (px0, py0) = (x0.max(0.0) as i32, y0.max(0.0) as i32);
-    let (px1, py1) = ((x1 as i32).min(width), (y1 as i32).min(height));
-    for py in py0..py1 {
-        let sy = ((py as f32 - y0) / th * rgba.height() as f32) as u32;
-        let sy = sy.min(rgba.height() - 1);
-        for px in px0..px1 {
-            let sx = ((px as f32 - x0) / tw * rgba.width() as f32) as u32;
-            let sx = sx.min(rgba.width() - 1);
-            let p = rgba.get_pixel(sx, sy).0;
-            let a = p[3] as u16;
-            if a == 0 {
-                continue;
-            }
-            let idx = (py as usize * width as usize + px as usize) * 4;
-            for (offset, src) in p[..3].iter().enumerate() {
-                let old = data[idx + offset] as u16;
-                data[idx + offset] = ((old * (255 - a) + *src as u16 * a) / 255) as u8;
-            }
+    for (sx, sy, p) in src.enumerate_pixels() {
+        let (px, py) = (ox + sx as i32, oy + sy as i32);
+        if px < 0 || py < 0 || px >= width || py >= height {
+            continue;
         }
+        let a = p[3] as u16;
+        if a == 0 {
+            continue;
+        }
+        let idx = (py as usize * width as usize + px as usize) * 4;
+        for (offset, src) in p.0[..3].iter().enumerate() {
+            let old = data[idx + offset] as u16;
+            data[idx + offset] = ((old * (255 - a) + *src as u16 * a) / 255) as u8;
+        }
+    }
+}
+
+/// Копирует `src` в `dst` левым верхним углом в точку (x, y) построчно
+/// (без смешивания). Части `src` за пределами `dst` отбрасываются.
+pub fn copy_pixmap(dst: &mut Pixmap, src: &Pixmap, x: u32, y: u32) {
+    let (dw, dh) = (dst.width() as usize, dst.height() as usize);
+    let (sw, sh) = (src.width() as usize, src.height() as usize);
+    let (x, y) = (x as usize, y as usize);
+    if x >= dw || y >= dh {
+        return;
+    }
+    let w = sw.min(dw - x) * 4;
+    let src_data = src.data();
+    let dst_data = dst.data_mut();
+    for row in 0..sh.min(dh - y) {
+        let s = row * sw * 4;
+        let d = ((y + row) * dw + x) * 4;
+        dst_data[d..d + w].copy_from_slice(&src_data[s..s + w]);
     }
 }
 
@@ -674,16 +1516,12 @@ fn fill_pattern_overlay(
 }
 
 /// Заливка фона ячеек, включая узоры (до рамок и текста).
-fn draw_backgrounds(
-    doc: &Document,
-    layout: &Layout,
-    merge_of: &HashMap<(u32, u32), usize>,
-    pixmap: &mut Pixmap,
-) {
+fn draw_backgrounds(doc: &Document, layout: &Layout, prep: &Prepared, pixmap: &mut Pixmap) {
+    let merge_of = &prep.merges;
     for row in &doc.rows {
         let r = row.index;
         for (col, cell) in &row.cells {
-            let fmt = effective_format(doc, row.format, cell);
+            let fmt = prep.format(row.format, cell);
             let bg = fmt.bg_color.and_then(|i| doc.color_rgb(i));
             let pattern = fmt.pattern.unwrap_or(PATTERN_NONE);
             // Узор заливается только при явном (абсолютном) цвете узора. Если
@@ -838,12 +1676,8 @@ fn draw_v_border(
     }
 }
 
-fn draw_borders(
-    doc: &Document,
-    layout: &Layout,
-    merge_of: &HashMap<(u32, u32), usize>,
-    pixmap: &mut Pixmap,
-) {
+fn draw_borders(doc: &Document, layout: &Layout, prep: &Prepared, pixmap: &mut Pixmap) {
+    let merge_of = &prep.merges;
     let scale = layout.scale;
     for row in &doc.rows {
         let r = row.index;
@@ -872,7 +1706,7 @@ fn draw_borders(
                     (a, b, c, d)
                 }
             };
-            let fmt = effective_format(doc, row.format, cell);
+            let fmt = prep.format(row.format, cell);
             let color = fmt
                 .borders_color
                 .and_then(|i| doc.color_rgb(i))
@@ -897,9 +1731,10 @@ fn draw_texts(
     doc: &Document,
     fonts: &Fonts,
     layout: &Layout,
-    merge_of: &HashMap<(u32, u32), usize>,
+    prep: &Prepared,
     pixmap: &mut Pixmap,
 ) {
+    let merge_of = &prep.merges;
     let scale = layout.scale;
     // тексты соседних ячеек, чтобы «выпускать» текст поверх пустых
     let occupied: HashMap<(u32, u32), bool> = doc
@@ -929,10 +1764,10 @@ fn draw_texts(
                     continue;
                 }
             }
-            let fmt = effective_format(doc, row.format, cell);
-            let spec = font_spec(doc, &fmt);
+            let fmt = prep.format(row.format, cell);
+            let spec = font_spec(doc, fmt);
             let px = font_px(&spec, scale);
-            let scaled = fonts.pick(&spec).as_scaled(px);
+            let scaled = fonts.scaled(&spec, px);
             let text_color = fmt
                 .text_color
                 .and_then(|i| doc.color_rgb(i))
@@ -948,7 +1783,7 @@ fn draw_texts(
 
             let pad = CELL_PAD_X * scale;
 
-            if is_vertical(&fmt) {
+            if is_vertical(fmt) {
                 let vlines: Vec<String> = text
                     .split('\n')
                     .map(|l| l.trim_end_matches('\r').to_string())
@@ -960,19 +1795,40 @@ fn draw_texts(
                     scale,
                     &vlines,
                     (x0, y0, x1, y1),
-                    &fmt,
+                    fmt,
                     text_color,
+                );
+                continue;
+            }
+            if let Some(angle) = text_angle(fmt) {
+                let rlines: Vec<String> = text
+                    .split('\n')
+                    .map(|l| l.trim_end_matches('\r').to_string())
+                    .collect();
+                draw_rotated_text(
+                    pixmap,
+                    fonts,
+                    &spec,
+                    scale,
+                    &rlines,
+                    (x0, y0, x1, y1),
+                    fmt,
+                    text_color,
+                    angle,
                 );
                 continue;
             }
             let control = fmt.text_control.unwrap_or(0);
             let h_align = fmt.h_align.unwrap_or(0);
-            let lines: Vec<String> = if control == 3 {
-                wrap_text(fonts, &spec, scale, text, (x1 - x0 - 2.0 * pad).max(4.0))
+            // строки и признак «последняя в абзаце» (для выравнивания по ширине)
+            let (lines, paragraph_ends): (Vec<String>, Vec<bool>) = if control == 3 {
+                wrap_text_paragraphs(fonts, &spec, scale, text, (x1 - x0 - 2.0 * pad).max(4.0))
+                    .into_iter()
+                    .unzip()
             } else {
                 text.split('\n')
-                    .map(|l| l.trim_end_matches('\r').to_string())
-                    .collect()
+                    .map(|l| (l.trim_end_matches('\r').to_string(), true))
+                    .unzip()
             };
 
             // «выпуск» текста на соседние пустые ячейки (контроль = авто)
@@ -1047,6 +1903,33 @@ fn draw_texts(
                     }
                 }
 
+                let baseline = top + li as f32 * lh + scaled.ascent();
+                // по ширине: строка переноса, кроме последней в абзаце,
+                // растягивается на ширину ячейки за счёт пробелов
+                if h_align == 4 && control != 2 && !paragraph_ends[li] {
+                    let avail = x1 - x0 - 2.0 * pad;
+                    if let Some(lw) = draw_justified_line(
+                        pixmap,
+                        fonts,
+                        &scaled,
+                        (&spec, scale),
+                        line,
+                        (x0 + pad, baseline, avail),
+                        (clip_x0, y0, clip_x1, y1),
+                        text_color,
+                    ) {
+                        let deco_t = scale.max(1.0).round();
+                        if spec.underline {
+                            let uy = (baseline + 1.5 * scale).min(y1 - 1.0);
+                            fill_rect(pixmap, x0 + pad, uy, lw, deco_t, text_color);
+                        }
+                        if spec.strikeout {
+                            let sy = baseline - scaled.ascent() * 0.35;
+                            fill_rect(pixmap, x0 + pad, sy, lw, deco_t, text_color);
+                        }
+                        continue;
+                    }
+                }
                 let lw = text_width(fonts, &spec, scale, &line_to_draw);
                 let tx = if control == 2 {
                     x0 + pad
@@ -1057,9 +1940,9 @@ fn draw_texts(
                         _ => x0 + pad,
                     }
                 };
-                let baseline = top + li as f32 * lh + scaled.ascent();
                 draw_line_of_text(
                     pixmap,
+                    fonts,
                     &scaled,
                     &line_to_draw,
                     tx,
@@ -1100,9 +1983,11 @@ fn blend_pixel(data: &mut [u8], width: usize, px: i32, py: i32, cov: f32, color:
 }
 
 /// Рисует одну строку текста с альфа-смешиванием, с отсечением по clip.
-fn draw_line_of_text<SF: ScaleFont<F>, F: Font>(
+#[allow(clippy::too_many_arguments)]
+fn draw_line_of_text(
     pixmap: &mut Pixmap,
-    scaled: &SF,
+    fonts: &Fonts,
+    scaled: &ScaledFace,
     line: &str,
     start_x: f32,
     baseline: f32,
@@ -1112,6 +1997,7 @@ fn draw_line_of_text<SF: ScaleFont<F>, F: Font>(
     let width = pixmap.width() as i32;
     let height = pixmap.height() as i32;
     let (cx0, cy0, cx1, cy1) = clip;
+    let data = pixmap.data_mut();
     let mut x = start_x;
     let mut prev = None;
     for ch in line.chars() {
@@ -1119,30 +2005,200 @@ fn draw_line_of_text<SF: ScaleFont<F>, F: Font>(
             prev = None;
             continue;
         }
-        let id = scaled.glyph_id(ch);
+        let g = scaled.glyph(ch);
         if let Some(p) = prev {
-            x += scaled.kern(p, id);
+            x += scaled.kern(p, g);
         }
-        let glyph = id.with_scale_and_position(scaled.scale(), ab_glyph::point(x, baseline));
-        if let Some(outlined) = scaled.font().outline_glyph(glyph) {
-            let bounds = outlined.px_bounds();
-            let data = pixmap.data_mut();
-            outlined.draw(|gx, gy, cov| {
-                let px = bounds.min.x as i32 + gx as i32;
-                let py = bounds.min.y as i32 + gy as i32;
+        let (bitmap, base_x, base_y) = fonts.glyph_bitmap(scaled, g, x, baseline);
+        if let Some(bitmap) = bitmap {
+            let min_x = (base_x + bitmap.min_x) as i32;
+            let min_y = (base_y + bitmap.min_y) as i32;
+            for (i, &cov) in bitmap.coverage.iter().enumerate() {
+                let px = min_x + (i % bitmap.w) as i32;
+                let py = min_y + (i / bitmap.w) as i32;
                 if px < 0 || py < 0 || px >= width || py >= height {
-                    return;
+                    continue;
                 }
                 let fx = px as f32;
                 let fy = py as f32;
                 if fx < cx0 - 0.5 || fx > cx1 - 0.5 || fy < cy0 || fy > cy1 {
-                    return;
+                    continue;
                 }
                 blend_pixel(data, width as usize, px, py, cov, color);
-            });
+            }
         }
-        x += scaled.h_advance(id);
-        prev = Some(id);
+        x += scaled.h_advance(g);
+        prev = Some(g);
+    }
+}
+
+/// Рисует строку по ширине: слова расставляются так, что строка занимает
+/// ширину `avail` от `x`. Возвращает ширину строки или `None`, если
+/// растягивать нечего (одно слово) или строка шире области.
+#[allow(clippy::too_many_arguments)]
+fn draw_justified_line(
+    pixmap: &mut Pixmap,
+    fonts: &Fonts,
+    scaled: &ScaledFace,
+    (spec, scale): (&FontSpec, f32),
+    line: &str,
+    (x, baseline, avail): (f32, f32, f32),
+    clip: (f32, f32, f32, f32),
+    color: Rgb,
+) -> Option<f32> {
+    let words: Vec<&str> = line.split(' ').filter(|w| !w.is_empty()).collect();
+    if words.len() < 2 {
+        return None;
+    }
+    let widths: Vec<f32> = words
+        .iter()
+        .map(|w| text_width(fonts, spec, scale, w))
+        .collect();
+    let gap = (avail - widths.iter().sum::<f32>()) / (words.len() - 1) as f32;
+    if gap <= 0.0 {
+        return None;
+    }
+    let mut pen = x;
+    for (word, w) in words.iter().zip(&widths) {
+        draw_line_of_text(pixmap, fonts, scaled, word, pen, baseline, clip, color);
+        pen += w + gap;
+    }
+    Some(avail)
+}
+
+/// Рисует блок строк, повёрнутый на `angle`° против часовой стрелки.
+/// Строки растеризуются в буфер покрытия, который затем поворачивается
+/// обратным отображением с билинейной выборкой (без «дыр» при углах,
+/// не кратных 90°). Повёрнутый блок выравнивается в ячейке по
+/// горизонтали и вертикали (по умолчанию — по центру).
+#[allow(clippy::too_many_arguments)]
+fn draw_rotated_text(
+    pixmap: &mut Pixmap,
+    fonts: &Fonts,
+    spec: &FontSpec,
+    scale: f32,
+    lines: &[String],
+    rect: (f32, f32, f32, f32),
+    fmt: &CellFormat,
+    color: Rgb,
+    angle: f32,
+) {
+    let (x0, y0, x1, y1) = rect;
+    let scaled = fonts.scaled(spec, font_px(spec, scale));
+    let lh = scaled.ascent() - scaled.descent();
+    let widths: Vec<f32> = lines
+        .iter()
+        .map(|l| text_width(fonts, spec, scale, l))
+        .collect();
+    let block_w = widths.iter().copied().fold(0.0f32, f32::max);
+    let block_h = lines.len() as f32 * lh;
+    if block_w < 1.0 {
+        return;
+    }
+    // растр блока: покрытие 0..1
+    let bw = block_w.ceil() as usize + 2;
+    let bh = block_h.ceil() as usize + 2;
+    if bw * bh > 50_000_000 {
+        return;
+    }
+    let mut coverage = vec![0.0f32; bw * bh];
+    for (li, (line, lw)) in lines.iter().zip(&widths).enumerate() {
+        let start = match fmt.h_align.unwrap_or(6) {
+            0 | 4 => 1.0,
+            2 => 1.0 + block_w - lw,
+            _ => 1.0 + (block_w - lw) / 2.0,
+        };
+        let baseline = 1.0 + li as f32 * lh + scaled.ascent();
+        let mut pen = start;
+        let mut prev = None;
+        for ch in line.chars() {
+            if ch.is_control() {
+                prev = None;
+                continue;
+            }
+            let g = scaled.glyph(ch);
+            if let Some(p) = prev {
+                pen += scaled.kern(p, g);
+            }
+            let (bitmap, base_x, base_y) = fonts.glyph_bitmap(&scaled, g, pen, baseline);
+            if let Some(bitmap) = bitmap {
+                let min_x = (base_x + bitmap.min_x) as i32;
+                let min_y = (base_y + bitmap.min_y) as i32;
+                for (i, &cov) in bitmap.coverage.iter().enumerate() {
+                    let px = min_x + (i % bitmap.w) as i32;
+                    let py = min_y + (i / bitmap.w) as i32;
+                    if px >= 0 && py >= 0 && (px as usize) < bw && (py as usize) < bh {
+                        let c = &mut coverage[py as usize * bw + px as usize];
+                        *c = (*c + cov).min(1.0);
+                    }
+                }
+            }
+            pen += scaled.h_advance(g);
+            prev = Some(g);
+        }
+    }
+
+    // положение повёрнутого блока в ячейке
+    let (rw, rh) = rotated_size(bw as f32, bh as f32, angle);
+    let pad = CELL_PAD_X * scale;
+    let cx = match fmt.h_align.unwrap_or(6) {
+        0 | 4 => x0 + pad + rw / 2.0,
+        2 => x1 - pad - rw / 2.0,
+        _ => (x0 + x1) / 2.0,
+    };
+    let cy = match fmt.v_align.unwrap_or(24) {
+        0 => y0 + pad + rh / 2.0,
+        8 => y1 - pad - rh / 2.0,
+        _ => (y0 + y1) / 2.0,
+    };
+    // угол повёрнутого блока — в целых пикселях: при углах, кратных 90°,
+    // выборка попадает точно в пиксели растра (без размытия)
+    let cx = (cx - rw / 2.0).round() + rw / 2.0;
+    let cy = (cy - rh / 2.0).round() + rh / 2.0;
+    let (sin, cos) = angle.to_radians().sin_cos();
+    let (scx, scy) = (bw as f32 / 2.0, bh as f32 / 2.0);
+    let width = pixmap.width() as i32;
+    let height = pixmap.height() as i32;
+    let left = ((cx - rw / 2.0).floor() as i32)
+        .max(x0.floor() as i32)
+        .max(0);
+    let right = ((cx + rw / 2.0).ceil() as i32)
+        .min(x1.ceil() as i32)
+        .min(width);
+    let top = ((cy - rh / 2.0).floor() as i32)
+        .max(y0.floor() as i32)
+        .max(0);
+    let bottom = ((cy + rh / 2.0).ceil() as i32)
+        .min(y1.ceil() as i32)
+        .min(height);
+    let sample = |x: f32, y: f32| -> f32 {
+        let (fx, fy) = (x.floor(), y.floor());
+        let (ix, iy) = (fx as i64, fy as i64);
+        let (tx, ty) = (x - fx, y - fy);
+        let at = |ax: i64, ay: i64| -> f32 {
+            if ax < 0 || ay < 0 || ax as usize >= bw || ay as usize >= bh {
+                0.0
+            } else {
+                coverage[ay as usize * bw + ax as usize]
+            }
+        };
+        let top = at(ix, iy) * (1.0 - tx) + at(ix + 1, iy) * tx;
+        let bottom = at(ix, iy + 1) * (1.0 - tx) + at(ix + 1, iy + 1) * tx;
+        top * (1.0 - ty) + bottom * ty
+    };
+    let data = pixmap.data_mut();
+    for py in top..bottom {
+        for px in left..right {
+            // центр пикселя относительно центра блока на странице
+            let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
+            // обратный поворот (поворот против часовой при оси y вниз)
+            let sx = dx * cos - dy * sin + scx - 0.5;
+            let sy = dx * sin + dy * cos + scy - 0.5;
+            let cov = sample(sx, sy);
+            if cov > 0.0 {
+                blend_pixel(data, width as usize, px, py, cov, color);
+            }
+        }
     }
 }
 
@@ -1162,7 +2218,7 @@ fn draw_vertical_text(
 ) {
     let (x0, y0, x1, y1) = rect;
     let px = font_px(spec, scale);
-    let scaled = fonts.pick(spec).as_scaled(px);
+    let scaled = fonts.scaled(spec, px);
     let lh = scaled.ascent() - scaled.descent();
     let pad = CELL_PAD_X * scale;
     let block_w = lines.len() as f32 * lh;
@@ -1184,16 +2240,18 @@ fn draw_vertical_text(
             _ => (y0 + y1 + lw) / 2.0,
         };
         let axis_x = left + li as f32 * lh + scaled.ascent();
-        draw_line_of_text_rotated(pixmap, &scaled, line, axis_x, bottom, rect, color);
+        draw_line_of_text_rotated(pixmap, fonts, &scaled, line, axis_x, bottom, rect, color);
     }
 }
 
 /// Рисует строку текста, повёрнутую на 90° против часовой стрелки
 /// (чтение снизу вверх). `axis_x` — x вертикальной базовой линии,
 /// `bottom_y` — y начала текста.
-fn draw_line_of_text_rotated<SF: ScaleFont<F>, F: Font>(
+#[allow(clippy::too_many_arguments)]
+fn draw_line_of_text_rotated(
     pixmap: &mut Pixmap,
-    scaled: &SF,
+    fonts: &Fonts,
+    scaled: &ScaledFace,
     line: &str,
     axis_x: f32,
     bottom_y: f32,
@@ -1203,6 +2261,7 @@ fn draw_line_of_text_rotated<SF: ScaleFont<F>, F: Font>(
     let width = pixmap.width() as i32;
     let height = pixmap.height() as i32;
     let (cx0, cy0, cx1, cy1) = clip;
+    let data = pixmap.data_mut();
     let mut pen = 0.0f32; // продвижение вдоль текста
     let mut prev = None;
     for ch in line.chars() {
@@ -1210,34 +2269,34 @@ fn draw_line_of_text_rotated<SF: ScaleFont<F>, F: Font>(
             prev = None;
             continue;
         }
-        let id = scaled.glyph_id(ch);
+        let g = scaled.glyph(ch);
         if let Some(p) = prev {
-            pen += scaled.kern(p, id);
+            pen += scaled.kern(p, g);
         }
         // глиф раскладывается в «горизонтальном» пространстве от (pen, 0),
         // затем каждый пиксель поворачивается: (dx, dy) → (dy, -dx)
-        let glyph = id.with_scale_and_position(scaled.scale(), ab_glyph::point(pen, 0.0));
-        if let Some(outlined) = scaled.font().outline_glyph(glyph) {
-            let bounds = outlined.px_bounds();
-            let data = pixmap.data_mut();
-            outlined.draw(|gx, gy, cov| {
-                let dx = bounds.min.x + gx as f32;
-                let dy = bounds.min.y + gy as f32;
+        let (bitmap, base_x, base_y) = fonts.glyph_bitmap(scaled, g, pen, 0.0);
+        if let Some(bitmap) = bitmap {
+            let min_x = base_x + bitmap.min_x;
+            let min_y = base_y + bitmap.min_y;
+            for (i, &cov) in bitmap.coverage.iter().enumerate() {
+                let dx = min_x + (i % bitmap.w) as f32;
+                let dy = min_y + (i / bitmap.w) as f32;
                 let tx = (axis_x + dy).round() as i32;
                 let ty = (bottom_y - dx).round() as i32;
                 if tx < 0 || ty < 0 || tx >= width || ty >= height {
-                    return;
+                    continue;
                 }
                 let fx = tx as f32;
                 let fy = ty as f32;
                 if fx < cx0 - 0.5 || fx > cx1 - 0.5 || fy < cy0 || fy > cy1 {
-                    return;
+                    continue;
                 }
                 blend_pixel(data, width as usize, tx, ty, cov, color);
-            });
+            }
         }
-        pen += scaled.h_advance(id);
-        prev = Some(id);
+        pen += scaled.h_advance(g);
+        prev = Some(g);
     }
 }
 
@@ -1245,78 +2304,195 @@ fn draw_line_of_text_rotated<SF: ScaleFont<F>, F: Font>(
 // Кодирование
 // ---------------------------------------------------------------------------
 
-/// Полный конвейер: модель → картинка в памяти (для возврата в 1С
-/// значением типа ДвоичныеДанные).
-pub fn convert_to_bytes(
-    doc: &Document,
-    kind: &ImageKind,
-    scale_percent: u32,
-) -> Result<Vec<u8>, String> {
-    let pixmap = render(doc, scale_percent)?;
-    encode_to_vec(&pixmap, kind)
+/// Размер в мегабайтах с одним знаком после запятой (для сообщений).
+fn megabytes(bytes: usize) -> String {
+    format!("{:.1}", bytes as f64 / 1_000_000.0)
 }
 
-/// Кодирует растровый буфер в JPEG или PNG в памяти с лимитом размера.
-pub fn encode_to_vec_limited(
+/// Сведения для заголовка файла картинки.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ImageMeta {
+    /// Разрешение (точек на дюйм) — чтобы картинка печаталась и
+    /// вставлялась в документы в натуральную величину
+    pub dpi: Option<f32>,
+    /// Картинка в оттенках серого: кодируется одним каналом (файл меньше)
+    pub grayscale: bool,
+}
+
+/// Кодирует растровый буфер в JPEG или PNG в памяти; результат больше
+/// `max_bytes` считается ошибкой.
+pub fn encode_to_vec(
     pixmap: &Pixmap,
     kind: &ImageKind,
     max_bytes: usize,
 ) -> Result<Vec<u8>, String> {
+    encode_image(pixmap, kind, max_bytes, ImageMeta::default())
+}
+
+/// Как [`encode_to_vec`], с разрешением и признаком оттенков серого.
+pub fn encode_image(
+    pixmap: &Pixmap,
+    kind: &ImageKind,
+    max_bytes: usize,
+    meta: ImageMeta,
+) -> Result<Vec<u8>, String> {
     let (w, h) = (pixmap.width(), pixmap.height());
-    // Pixmap хранит премультиплицированный RGBA; альфа везде 255,
-    // данные можно использовать напрямую, отбросив альфу.
-    let rgb: Vec<u8> = pixmap
-        .data()
-        .chunks_exact(4)
-        .flat_map(|p| [p[0], p[1], p[2]])
-        .collect();
+    let pixels = w as usize * h as usize;
+    // Pixmap хранит премультиплицированный RGBA; все этапы рендера дают
+    // непрозрачные пиксели (альфа 255), для которых он совпадает с обычным.
+    let gray = if meta.grayscale {
+        let mut gray = try_buffer(pixels)?;
+        gray.extend(pixmap.data().as_chunks::<4>().0.iter().map(|p| p[0]));
+        Some(gray)
+    } else {
+        None
+    };
     let mut out = Vec::new();
     match kind {
         ImageKind::Jpeg { quality } => {
-            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, *quality);
-            image::ImageEncoder::write_image(encoder, &rgb, w, h, image::ExtendedColorType::Rgb8)
-                .map_err(|e| format!("ошибка кодирования JPEG: {e}"))?;
+            // jpeg-encoder в 2–3 раза быстрее кодера из `image` при том же
+            // качестве и размере файла и кодирует RGBA напрямую (альфа
+            // отбрасывается) — без промежуточной RGB-копии. Субдискретизация
+            // цвета отключена (4:4:4, как у прежнего кодера): с 4:2:0 файл
+            // меньше, но расплывается цветной текст и тонкие цветные рамки.
+            let mut encoder = jpeg_encoder::Encoder::new(&mut out, *quality);
+            encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
+            if let Some(dpi) = meta.dpi {
+                let dpi = dpi.round().clamp(1.0, u16::MAX as f32) as u16;
+                encoder.set_density(jpeg_encoder::PixelDensity::dpi(dpi));
+            }
+            let result = match &gray {
+                Some(gray) => {
+                    encoder.encode(gray, w as u16, h as u16, jpeg_encoder::ColorType::Luma)
+                }
+                None => encoder.encode(
+                    pixmap.data(),
+                    w as u16,
+                    h as u16,
+                    jpeg_encoder::ColorType::Rgba,
+                ),
+            };
+            result.map_err(|e| format!("ошибка кодирования JPEG: {e}"))?;
         }
-        ImageKind::Png => {
-            let encoder = image::codecs::png::PngEncoder::new(&mut out);
-            image::ImageEncoder::write_image(encoder, &rgb, w, h, image::ExtendedColorType::Rgb8)
-                .map_err(|e| format!("ошибка кодирования PNG: {e}"))?;
+        ImageKind::Png { compression } => {
+            let mut encoder = png::Encoder::new(&mut out, w, h);
+            encoder.set_depth(png::BitDepth::Eight);
+            // Уровни подобраны замером на документах: уровень 1 почти так же
+            // быстр, как fdeflate, но файл в 2–4 раза меньше; уровень 4 даёт
+            // размер как у стандартного (≈ уровень 6) вдвое быстрее.
+            match compression {
+                PngCompression::Fast => {
+                    encoder.set_deflate_compression(png::DeflateCompression::Level(1))
+                }
+                PngCompression::Default => {
+                    encoder.set_deflate_compression(png::DeflateCompression::Level(4))
+                }
+                PngCompression::Best => encoder.set_compression(png::Compression::High),
+            }
+            encoder.set_filter(png::Filter::Adaptive);
+            if let Some(dpi) = meta.dpi {
+                // pHYs хранит точки на метр
+                let ppm = (dpi as f64 / 0.0254).round() as u32;
+                encoder.set_pixel_dims(Some(png::PixelDimensions {
+                    xppu: ppm,
+                    yppu: ppm,
+                    unit: png::Unit::Meter,
+                }));
+            }
+            let data = match gray {
+                Some(gray) => {
+                    encoder.set_color(png::ColorType::Grayscale);
+                    gray
+                }
+                None => {
+                    encoder.set_color(png::ColorType::Rgb);
+                    let mut rgb = try_buffer(pixels * 3)?;
+                    for p in pixmap.data().as_chunks::<4>().0.iter() {
+                        rgb.extend_from_slice(&p[..3]);
+                    }
+                    rgb
+                }
+            };
+            let png_error = |e: png::EncodingError| format!("ошибка кодирования PNG: {e}");
+            let mut writer = encoder.write_header().map_err(png_error)?;
+            writer.write_image_data(&data).map_err(png_error)?;
+            writer.finish().map_err(png_error)?;
         }
     }
     if out.len() > max_bytes {
+        let hint = match kind {
+            ImageKind::Jpeg { .. } => {
+                "уменьшите Масштаб или Качество (для документов с текстом PNG обычно меньше JPEG)"
+            }
+            ImageKind::Png { .. } => "уменьшите Масштаб или задайте СжатиеPNG = 2",
+        };
         return Err(format!(
-            "слишком большая картинка: {} МБ (предел {} МБ) — уменьшите Масштаб",
-            out.len() / 1024 / 1024,
-            max_bytes / 1024 / 1024
+            "слишком большая картинка: {} МБ (предел МаксимальныйРазмерКартинки — {} МБ) — \
+             {hint} либо увеличьте МаксимальныйРазмерКартинки",
+            megabytes(out.len()),
+            megabytes(max_bytes)
         ));
     }
     Ok(out)
 }
 
-/// Кодирует растровый буфер в JPEG или PNG в памяти.
-pub fn encode_to_vec(pixmap: &Pixmap, kind: &ImageKind) -> Result<Vec<u8>, String> {
-    encode_to_vec_limited(pixmap, kind, 50 * 1024 * 1024)
-}
-
-/// Кодирует растровый буфер в файл JPEG или PNG с лимитом размера.
-pub fn encode_limited(
+/// Кодирует растровый буфер в файл JPEG или PNG (см. [`encode_to_vec`]).
+///
+/// Запись атомарная: данные пишутся во временный файл рядом с целевым и
+/// затем переименовываются, поэтому при ошибке записи (нет места на диске и
+/// т.п.) на месте картинки не остаётся обрезанный файл, а прежний файл с
+/// тем же именем сохраняется.
+pub fn encode_to_file(
     pixmap: &Pixmap,
     path: &Path,
     kind: &ImageKind,
     max_bytes: usize,
 ) -> Result<(), String> {
-    let bytes = encode_to_vec_limited(pixmap, kind, max_bytes)?;
-    let file = std::fs::File::create(path)
-        .map_err(|e| format!("не удалось создать файл {}: {e}", path.display()))?;
-    let mut writer = BufWriter::new(file);
-    std::io::Write::write_all(&mut writer, &bytes)
-        .map_err(|e| format!("не удалось записать файл {}: {e}", path.display()))?;
-    Ok(())
+    encode_image_to_file(pixmap, path, kind, max_bytes, ImageMeta::default())
 }
 
-/// Кодирует растровый буфер в файл JPEG или PNG.
-pub fn encode(pixmap: &Pixmap, path: &Path, kind: &ImageKind) -> Result<(), String> {
-    encode_limited(pixmap, path, kind, 50 * 1024 * 1024)
+/// Как [`encode_to_file`], с разрешением и признаком оттенков серого.
+pub fn encode_image_to_file(
+    pixmap: &Pixmap,
+    path: &Path,
+    kind: &ImageKind,
+    max_bytes: usize,
+    meta: ImageMeta,
+) -> Result<(), String> {
+    let bytes = encode_image(pixmap, kind, max_bytes, meta)?;
+    write_atomically(path, &bytes)
+}
+
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("не задано имя файла картинки: {}", path.display()))?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(file_name);
+    tmp_name.push(format!(
+        ".{}-{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp_path = path.with_file_name(tmp_name);
+
+    let result = (|| {
+        let mut file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("не удалось создать файл {}: {e}", path.display()))?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| format!("не удалось записать файл {}: {e}", path.display()))?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)
+            .map_err(|e| format!("не удалось записать файл {}: {e}", path.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1326,7 +2502,7 @@ pub fn encode(pixmap: &Pixmap, path: &Path, kind: &ImageKind) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mxl_parser::{parse_file, Row};
+    use crate::mxl_parser::{parse_file, FontFamily, FontSpec, Merge, Row};
     use std::path::PathBuf;
 
     fn mxl(name: &str) -> PathBuf {
@@ -1379,6 +2555,7 @@ mod tests {
                     Cell {
                         format: 1,
                         text: Some("Тестова комірка".to_string()),
+                        value: None,
                     },
                 )],
             }],
@@ -1392,12 +2569,18 @@ mod tests {
         let jpg = out_dir().join("synthetic.jpg");
         let png = out_dir().join("synthetic.png");
         convert(&doc, &jpg, &ImageKind::Jpeg { quality: 90 }, 100).unwrap();
-        convert(&doc, &png, &ImageKind::Png, 100).unwrap();
+        convert(&doc, &png, &ImageKind::PNG, 100).unwrap();
         let img = image::open(&png).unwrap();
         assert!(img.width() > 10 && img.height() > 5);
         // текст и рамки дают тёмные пиксели
         let pm = render(&doc, 100).unwrap();
-        let dark = pm.data().chunks_exact(4).filter(|p| p[0] < 128).count();
+        let dark = pm
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] < 128)
+            .count();
         assert!(dark > 50, "тёмных пикселей всего {dark}");
     }
 
@@ -1450,6 +2633,7 @@ mod tests {
                     Cell {
                         format: 1,
                         text: Some("*".to_string()),
+                        value: None,
                     },
                 )],
             }],
@@ -1472,6 +2656,7 @@ mod tests {
                     Cell {
                         format: 1,
                         text: Some("*".to_string()),
+                        value: None,
                     },
                 )],
             }],
@@ -1479,10 +2664,18 @@ mod tests {
         };
         let pm_normal = render(&doc_normal, 100).unwrap();
 
-        let dark_block = pm.data().chunks_exact(4).filter(|p| p[0] < 128).count();
+        let dark_block = pm
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] < 128)
+            .count();
         let dark_normal = pm_normal
             .data()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] < 128)
             .count();
 
@@ -1520,6 +2713,7 @@ mod tests {
                         Cell {
                             format: 0,
                             text: Some("A".into()),
+                            value: None,
                         },
                     )],
                 },
@@ -1531,6 +2725,7 @@ mod tests {
                         Cell {
                             format: 0,
                             text: Some("B".into()),
+                            value: None,
                         },
                     )],
                 },
@@ -1578,6 +2773,7 @@ mod tests {
                     Cell {
                         format: 1,
                         text: Some("X".into()),
+                        value: None,
                     },
                 )],
             }],
@@ -1587,7 +2783,9 @@ mod tests {
         let total = (pm.width() * pm.height()) as usize;
         let black = pm
             .data()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] < 30 && p[1] < 30 && p[2] < 30)
             .count();
         assert!(
@@ -1622,6 +2820,7 @@ mod tests {
                             Cell {
                                 format: 0,
                                 text: Some("Верх".into()),
+                                value: None,
                             },
                         ),
                         (
@@ -1629,6 +2828,7 @@ mod tests {
                             Cell {
                                 format: 0,
                                 text: Some("A".into()),
+                                value: None,
                             },
                         ),
                     ],
@@ -1642,6 +2842,7 @@ mod tests {
                             Cell {
                                 format: 0,
                                 text: None,
+                                value: None,
                             },
                         ),
                         (
@@ -1649,6 +2850,7 @@ mod tests {
                             Cell {
                                 format: 0,
                                 text: row1_text.map(str::to_string),
+                                value: None,
                             },
                         ),
                     ],
@@ -1678,7 +2880,7 @@ mod tests {
         let jpg = out_dir().join("akt.jpg");
         let png = out_dir().join("akt.png");
         convert(&doc, &jpg, &ImageKind::Jpeg { quality: 90 }, 100).unwrap();
-        convert(&doc, &png, &ImageKind::Png, 100).unwrap();
+        convert(&doc, &png, &ImageKind::PNG, 100).unwrap();
         // валидность: декодируется обратно и размеры совпадают
         let img = image::open(&jpg).unwrap();
         let img2 = image::open(&png).unwrap();
@@ -1729,7 +2931,7 @@ mod tests {
         let pm = render(&doc, 100).unwrap();
         let mut has_red = false;
         let mut has_title_blue = false;
-        for p in pm.data().chunks_exact(4) {
+        for p in pm.data().as_chunks::<4>().0.iter() {
             if p[0] > 200 && p[1] < 60 && p[2] < 60 {
                 has_red = true;
             }
@@ -1757,7 +2959,8 @@ mod tests {
         // ячейка «Узор 17» (строка 7, колонка 0): фон + штриховка цветом
         // узора дают минимум два разных цвета внутри ячейки
         let fonts = Fonts::load().unwrap();
-        let layout = build_layout(&doc, &fonts, 1.0).unwrap();
+        let prep = Prepared::new(&doc).unwrap();
+        let layout = build_layout(&doc, &fonts, &prep, 1.0).unwrap();
         let (x0, x1) = layout.col_x(7, 0);
         let (y0, y1) = layout.row_range(7);
         let mut distinct = std::collections::HashSet::new();
@@ -1772,7 +2975,9 @@ mod tests {
         // логотипа (не из палитры документа)
         let non_white = pm
             .data()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] < 250 || p[1] < 250 || p[2] < 250)
             .count();
         assert!(non_white > 10_000, "слишком пустой рендер: {non_white}");
@@ -1785,8 +2990,758 @@ mod tests {
         }
         let doc = parse_file(&mxl("Сетка.mxl")).unwrap();
         let pm = render(&doc, 100).unwrap();
-        let dark = pm.data().chunks_exact(4).filter(|p| p[0] < 128).count();
+        let dark = pm
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] < 128)
+            .count();
         // на картинке должно быть заметное количество тёмных пикселей (текст)
         assert!(dark > 1000, "тёмных пикселей всего {dark}");
+    }
+
+    /// Документ из одной ячейки с текстом в строке `row`, колонке `col`.
+    fn one_cell_doc(row: u32, col: u32) -> Document {
+        Document {
+            rows: vec![Row {
+                index: row,
+                format: 0,
+                cells: vec![(
+                    col,
+                    Cell {
+                        format: 0,
+                        text: Some("x".to_string()),
+                        value: None,
+                    },
+                )],
+            }],
+            ..Document::default()
+        }
+    }
+
+    #[test]
+    fn huge_row_or_column_index_is_rejected_before_layout() {
+        // раньше: выделение ~8 ГБ под границы строк и аварийное завершение
+        for (row, col) in [
+            (2_000_000_000, 0),
+            (u32::MAX, 0),
+            (0, 2_000_000_000),
+            (0, u32::MAX),
+        ] {
+            let started = std::time::Instant::now();
+            let e = render(&one_cell_doc(row, col), 100).unwrap_err();
+            assert!(e.contains("слишком много"), "{e}");
+            assert!(started.elapsed().as_secs() < 2);
+        }
+    }
+
+    #[test]
+    fn huge_merge_does_not_hang() {
+        // раньше: карта «ячейка → объединение» на 10¹⁰ записей
+        let mut doc = synthetic_doc();
+        doc.merges.push(Merge {
+            left: 0,
+            top: 0,
+            right: 60_000,
+            bottom: 60_000,
+        });
+        let started = std::time::Instant::now();
+        let e = render(&doc, 100).unwrap_err();
+        assert!(e.contains("слишком большая картинка"), "{e}");
+        assert!(started.elapsed().as_secs() < 2);
+    }
+
+    #[test]
+    fn too_many_merge_index_entries_are_rejected() {
+        // 200 перекрывающихся объединений по 60 000 строк каждое
+        let mut doc = Document::default();
+        for r in 0..60_000 {
+            doc.rows.push(Row {
+                index: r,
+                format: 0,
+                cells: vec![],
+            });
+        }
+        for _ in 0..200 {
+            doc.merges.push(Merge {
+                left: 0,
+                top: 0,
+                right: 1,
+                bottom: 59_999,
+            });
+        }
+        let e = Prepared::new(&doc).err().unwrap();
+        assert!(e.contains("объединений"), "{e}");
+    }
+
+    #[test]
+    fn merge_index_finds_covering_merge() {
+        let doc = Document {
+            rows: (0..5)
+                .map(|index| Row {
+                    index,
+                    format: 0,
+                    cells: vec![],
+                })
+                .collect(),
+            merges: vec![
+                Merge {
+                    left: 1,
+                    top: 1,
+                    right: 2,
+                    bottom: 3,
+                },
+                Merge {
+                    left: 4,
+                    top: 0,
+                    right: 6,
+                    bottom: 0,
+                },
+            ],
+            ..Document::default()
+        };
+        let index = MergeIndex::new(&doc).unwrap();
+        assert_eq!(index.get(&(1, 1)), Some(&0));
+        assert_eq!(index.get(&(3, 2)), Some(&0));
+        assert_eq!(index.get(&(4, 2)), None);
+        assert_eq!(index.get(&(2, 0)), None);
+        assert_eq!(index.get(&(2, 3)), None);
+        assert_eq!(index.get(&(0, 5)), Some(&1));
+        assert!(!index.contains_key(&(0, 7)));
+    }
+
+    #[test]
+    fn image_size_limits() {
+        assert!(check_image_size(65_500, 3_000, "x").is_ok());
+        assert!(check_image_size(65_501, 1, "x").is_err());
+        let e = check_image_size(20_000, 20_000, "уменьшите Масштаб").unwrap_err();
+        assert!(
+            e.contains("Мпикс") && e.contains("уменьшите Масштаб"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn wrap_matches_reference_implementation() {
+        // эталон — прежний алгоритм с полным пересчётом ширины кандидата
+        fn reference(fonts: &Fonts, spec: &FontSpec, text: &str, max_w: f32) -> Vec<String> {
+            let mut lines = Vec::new();
+            for raw_line in text.split('\n') {
+                let raw_line = raw_line.trim_end_matches('\r');
+                if text_width(fonts, spec, 1.0, raw_line) <= max_w {
+                    lines.push(raw_line.to_string());
+                    continue;
+                }
+                let mut current = String::new();
+                for word in raw_line.split(' ') {
+                    let candidate = if current.is_empty() {
+                        word.to_string()
+                    } else {
+                        format!("{current} {word}")
+                    };
+                    if text_width(fonts, spec, 1.0, &candidate) <= max_w || current.is_empty() {
+                        current = candidate;
+                    } else {
+                        lines.push(std::mem::take(&mut current));
+                        current = word.to_string();
+                    }
+                }
+                if !current.is_empty() {
+                    lines.push(current);
+                }
+            }
+            if lines.is_empty() {
+                lines.push(String::new());
+            }
+            lines
+        }
+        let fonts = Fonts::load().unwrap();
+        let spec = FontSpec::default();
+        let texts = [
+            "Поставщик: ООО «Ромашка», ИНН 7700000000, г. Москва, ул. Ленина, д. 1",
+            "  двойные  пробелы   и\r\nперевод строки",
+            "оченьдлинноесловобезпробеловкотороене помещается",
+            "",
+            " ",
+        ];
+        for text in texts {
+            for max_w in [4.0, 30.0, 80.0, 150.0, 1000.0] {
+                assert_eq!(
+                    wrap_text(&fonts, &spec, 1.0, text, max_w),
+                    reference(&fonts, &spec, text, max_w),
+                    "{text:?} @ {max_w}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encode_to_file_replaces_file_atomically() {
+        let dir = out_dir();
+        let path = dir.join("atomic.png");
+        std::fs::write(&path, b"old").unwrap();
+        let pm = render(&synthetic_doc(), 100).unwrap();
+        encode_to_file(&pm, &path, &ImageKind::PNG, DEFAULT_MAX_IMAGE_BYTES).unwrap();
+        assert!(std::fs::read(&path).unwrap().starts_with(b"\x89PNG"));
+        // при ошибке (превышен предел размера) прежний файл не тронут
+        let e = encode_to_file(&pm, &path, &ImageKind::PNG, 10).unwrap_err();
+        assert!(e.contains("МаксимальныйРазмерКартинки"), "{e}");
+        assert!(std::fs::read(&path).unwrap().starts_with(b"\x89PNG"));
+        // временных файлов не осталось
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".atomic.png"))
+            .collect();
+        assert!(leftovers.is_empty());
+        // в несуществующий каталог — понятная ошибка
+        let e = encode_to_file(
+            &pm,
+            &dir.join("no/such/dir.png"),
+            &ImageKind::PNG,
+            DEFAULT_MAX_IMAGE_BYTES,
+        )
+        .unwrap_err();
+        assert!(e.contains("не удалось создать файл"), "{e}");
+    }
+
+    fn demo_doc(name: &str) -> Document {
+        parse_file(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../mxl-demo-collection")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn split_by_breaks_ignores_breaks_outside_range() {
+        assert_eq!(split_by_breaks(0, 10, &[]), vec![(0, 10)]);
+        assert_eq!(
+            split_by_breaks(0, 10, &[3, 7]),
+            vec![(0, 3), (4, 7), (8, 10)]
+        );
+        // разрыв на последней строке и вне диапазона — не делит
+        assert_eq!(split_by_breaks(2, 10, &[1, 10, 15]), vec![(2, 10)]);
+    }
+
+    #[test]
+    fn pages_follow_print_area_and_breaks() {
+        let doc = demo_doc("ДемонстрацияПечатиРазрывов_A4_Книжная.mxl");
+        let all = pages(&doc);
+        assert_eq!(
+            all,
+            vec![
+                PageRange {
+                    rows: (0, 24),
+                    cols: (0, 11)
+                },
+                PageRange {
+                    rows: (25, 35),
+                    cols: (0, 11)
+                },
+                PageRange {
+                    rows: (36, 48),
+                    cols: (0, 11)
+                },
+            ]
+        );
+        let full = render(&doc, 100).unwrap();
+        let heights: Vec<u32> = (1..=3)
+            .map(|n| {
+                let p = render_page(&doc, 100, n).unwrap();
+                assert_eq!(p.width(), full.width(), "страница {n}");
+                p.height()
+            })
+            .collect();
+        // страницы вместе покрывают документ (у каждой поля 1 + 2 px)
+        assert_eq!(heights.iter().sum::<u32>(), full.height() + 2 * 3);
+        let e = render_page(&doc, 100, 4).unwrap_err();
+        assert!(e.contains("всего 3 стр."), "{e}");
+        assert!(render_page(&doc, 100, 0).is_err());
+    }
+
+    #[test]
+    fn page_is_a_crop_of_the_full_render() {
+        let doc = demo_doc("ДемонстрацияПечатиРазрывов_A4_Книжная.mxl");
+        let full = render(&doc, 100).unwrap();
+        let page = render_page(&doc, 100, 2).unwrap();
+        // строка 26 (индекс 25) начинается на row_y[25]; страница — с поля 1 px
+        let fonts = Fonts::load().unwrap();
+        let prep = Prepared::new(&doc).unwrap();
+        let layout = build_layout(&doc, &fonts, &prep, 1.0).unwrap();
+        let top = layout.row_y[25] as u32 - 1;
+        let w = full.width() as usize * 4;
+        // внутренние строки страницы совпадают с полной картинкой; глифы
+        // могут отличаться на 1–2 единицы яркости — базовая линия текста на
+        // странице сдвинута на целое число px, но считается во float с
+        // другим округлением дробной части
+        let mut max_diff = 0u8;
+        let mut differing = 0usize;
+        for y in 3..page.height() - 3 {
+            let src = &full.data()[(top + y) as usize * w..][..w];
+            let dst = &page.data()[y as usize * w..][..w];
+            for (a, b) in src.iter().zip(dst) {
+                max_diff = max_diff.max(a.abs_diff(*b));
+                differing += (a != b) as usize;
+            }
+        }
+        assert!(max_diff <= 2, "максимальное отличие {max_diff}");
+        assert!(differing < 500, "отличающихся значений {differing}");
+    }
+
+    #[test]
+    fn document_without_print_area_is_one_page() {
+        let doc = synthetic_doc();
+        assert_eq!(pages(&doc).len(), 1);
+        let p = render_page(&doc, 100, 1).unwrap();
+        let full = render(&doc, 100).unwrap();
+        assert_eq!((p.width(), p.height()), (full.width(), full.height()));
+    }
+
+    #[test]
+    fn page_of_a_document_too_large_for_one_image() {
+        // 6000 строк с разрывом через каждые 100: целиком не помещается,
+        // постранично — помещается
+        let mut doc = Document {
+            formats: vec![CellFormat {
+                width: Some(4),
+                ..CellFormat::default()
+            }],
+            ..Document::default()
+        };
+        for r in 0..6000 {
+            doc.rows.push(Row {
+                index: r,
+                format: if r % 100 == 99 { 1 } else { 0 },
+                cells: vec![(
+                    0,
+                    Cell {
+                        format: 0,
+                        text: Some(format!("строка {r}")),
+                        value: None,
+                    },
+                )],
+            });
+        }
+        assert!(render(&doc, 100).unwrap_err().contains("НомерСтраницы"));
+        assert_eq!(pages(&doc).len(), 60);
+        let p = render_page(&doc, 100, 60).unwrap();
+        assert!(p.height() < 3000, "{}", p.height());
+    }
+
+    #[test]
+    fn font_families_and_fallback_glyphs() {
+        let fonts = Fonts::load().unwrap();
+        let mono = FontSpec {
+            family: FontFamily::Mono,
+            ..FontSpec::default()
+        };
+        // моноширинный: одинаковая ширина узких и широких букв
+        let narrow = text_width(&fonts, &mono, 1.0, "iiii");
+        let wide = text_width(&fonts, &mono, 1.0, "MMMM");
+        assert!((narrow - wide).abs() < 0.01, "{narrow} != {wide}");
+        let sans = FontSpec::default();
+        assert!(text_width(&fonts, &sans, 1.0, "iiii") < text_width(&fonts, &sans, 1.0, "MMMM"));
+        let serif = FontSpec {
+            family: FontFamily::Serif,
+            ..FontSpec::default()
+        };
+        assert_ne!(
+            text_width(&fonts, &serif, 1.0, "Счёт на оплату"),
+            text_width(&fonts, &sans, 1.0, "Счёт на оплату")
+        );
+        // символа «✓» нет в Liberation — берётся из запасного шрифта
+        let sf = fonts.scaled(&sans, 20.0);
+        assert!(sf.glyph('✓').0, "✓ должен браться из запасного шрифта");
+        assert!(!sf.glyph('Ж').0);
+        assert!(text_width(&fonts, &sans, 1.0, "✓") > 1.0);
+    }
+
+    #[test]
+    fn fallback_glyph_is_drawn() {
+        let mut doc = synthetic_doc();
+        doc.rows[0].cells[0].1.text = Some("✓✓✓".to_string());
+        let pm = render(&doc, 300).unwrap();
+        let dark = pm
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] < 100)
+            .count();
+        // рамка + глифы (без запасного шрифта рисовались бы пустые .notdef)
+        let mut empty = synthetic_doc();
+        empty.rows[0].cells[0].1.text = None;
+        let frame = render(&empty, 300)
+            .unwrap()
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] < 100)
+            .count();
+        assert!(dark > frame + 100, "глифов нет: {dark} vs {frame}");
+    }
+
+    #[test]
+    fn picture_downscaling_is_filtered() {
+        // шахматная доска 1 px, уменьшенная вдвое, даёт серый, а не
+        // чёрный/белый (как при выборке ближайшего пикселя)
+        let board = image::RgbaImage::from_fn(64, 64, |x, y| {
+            if (x + y) % 2 == 0 {
+                image::Rgba([0, 0, 0, 255])
+            } else {
+                image::Rgba([255, 255, 255, 255])
+            }
+        });
+        let mut pm = Pixmap::new(40, 40).unwrap();
+        pm.fill(tiny_skia::Color::WHITE);
+        blit_image(&mut pm, &board, 4.0, 4.0, 36.0, 36.0);
+        let i = ((20 * 40 + 20) * 4) as usize;
+        let v = pm.data()[i];
+        assert!((60..=200).contains(&v), "ожидался серый, получено {v}");
+        // за пределами картинки — фон
+        assert_eq!(pm.data()[0], 255);
+    }
+
+    /// Документ с дополнительной группой колонок шире группы по умолчанию:
+    /// строка 0 — в группе по умолчанию (2 узкие колонки), строка 1 — в
+    /// дополнительной группе (6 широких колонок, текст в последней).
+    fn doc_with_wide_extra_group() -> Document {
+        let text = |t: &str| Cell {
+            format: 0,
+            text: Some(t.to_string()),
+            value: None,
+        };
+        Document {
+            formats: vec![
+                CellFormat {
+                    width: Some(10),
+                    ..CellFormat::default()
+                },
+                CellFormat {
+                    width: Some(100),
+                    ..CellFormat::default()
+                },
+            ],
+            default_group: crate::mxl_parser::ColumnGroup {
+                columns: vec![(0, 1), (1, 1)],
+            },
+            extra_groups: vec![crate::mxl_parser::ColumnGroup {
+                columns: (0..6).map(|c| (c, 2)).collect(),
+            }],
+            row_groups: vec![(1, 0)],
+            rows: vec![
+                Row {
+                    index: 0,
+                    format: 0,
+                    cells: vec![(1, text("узкая"))],
+                },
+                Row {
+                    index: 1,
+                    format: 0,
+                    cells: vec![(5, text("широкая"))],
+                },
+            ],
+            ..Document::default()
+        }
+    }
+
+    #[test]
+    fn page_of_document_with_extra_column_group_matches_full_render() {
+        let doc = doc_with_wide_extra_group();
+        let full = render(&doc, 100).unwrap();
+        let page = render_page(&doc, 100, 1).unwrap();
+        assert_eq!(
+            (page.width(), page.height()),
+            (full.width(), full.height()),
+            "единственная страница должна совпадать с документом целиком"
+        );
+        assert!(page.data() == full.data());
+    }
+
+    #[test]
+    fn white_pixmap_and_buffer_limits() {
+        let p = white_pixmap(3, 2).unwrap();
+        assert!(p.data().iter().all(|&b| b == 255));
+        assert!(white_pixmap(0, 5).is_err());
+        let e = try_buffer(usize::MAX).unwrap_err();
+        assert!(e.contains("недостаточно памяти"), "{e}");
+    }
+
+    fn generated(name: &str) -> Document {
+        parse_file(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../mxl-demo-collection/generated")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn paginate_by_size_and_breaks() {
+        // элементы по 10 px, страница 25 px
+        let bounds: Vec<f32> = (0..=10).map(|i| i as f32 * 10.0).collect();
+        assert_eq!(
+            paginate(&bounds, 0, 9, 25.0, &[]),
+            vec![(0, 1), (2, 3), (4, 5), (6, 7), (8, 9)]
+        );
+        // явный разрыв после 2
+        assert_eq!(paginate(&bounds, 0, 5, 100.0, &[2]), vec![(0, 2), (3, 5)]);
+        // элемент длиннее страницы — отдельная страница
+        let tall = [0.0, 5.0, 105.0, 110.0];
+        assert_eq!(
+            paginate(&tall, 0, 2, 50.0, &[]),
+            vec![(0, 0), (1, 1), (2, 2)]
+        );
+    }
+
+    #[test]
+    fn print_job_pages_follow_paper_scale_and_orientation() {
+        let cases = [
+            (
+                demo_doc("ДемонстрацияПечатиРазрывов_A4_Книжная.mxl"),
+                6,
+                (827, 1169),
+            ),
+            (
+                demo_doc("ДемонстрацияПечатиРазрывов_A4_Альбомная.mxl"),
+                6,
+                (1169, 827),
+            ),
+            (
+                demo_doc("ДемонстрацияПечатиРазрывов_A3_Книжная.mxl"),
+                6,
+                (1169, 1654),
+            ),
+            (generated("Печать_A4_Альбомная_50.mxl"), 3, (1169, 827)),
+            (generated("Печать_A5_Книжная.mxl"), 9, (583, 827)),
+            (
+                generated("Печать_A3_Альбомная_Автомасштаб.mxl"),
+                3,
+                (1654, 1169),
+            ),
+            (generated("ДлиннаяТаблица_БезРазрывов.mxl"), 20, (827, 1169)),
+        ];
+        for (doc, pages, paper) in cases {
+            let job = PrintJob::new(&doc, 100).unwrap();
+            assert_eq!(job.page_count(), pages, "{:?}", doc.page_setup);
+            assert_eq!(job.paper_size_px(), paper);
+            let sheet = job.render(&doc, 1).unwrap();
+            assert_eq!((sheet.width(), sheet.height()), paper);
+        }
+        // автомасштаб уменьшает таблицу шириной ~400 мм до ширины A3 (396 мм)
+        let auto = PrintJob::new(&generated("Печать_A3_Альбомная_Автомасштаб.mxl"), 100).unwrap();
+        assert!(
+            (0.95..1.0).contains(&auto.print_scale()),
+            "{}",
+            auto.print_scale()
+        );
+    }
+
+    #[test]
+    fn print_sheet_has_margins_and_black_and_white() {
+        let doc = demo_doc("ДемонстрацияПечатиРазрывов_A4_Книжная.mxl");
+        let job = PrintJob::new(&doc, 100).unwrap();
+        let sheet = job.render(&doc, 1).unwrap();
+        // ЧерноБелаяПечать = Истина
+        assert!(is_grayscale(&sheet));
+        // поле сверху 10 мм (39 px при 100 DPI) — белое
+        let w = sheet.width() as usize;
+        let row_is_white = |y: usize| {
+            sheet.data()[y * w * 4..(y + 1) * w * 4]
+                .iter()
+                .all(|&b| b == 255)
+        };
+        assert!((0..35).all(row_is_white));
+        assert!(!row_is_white(45), "под полем начинается содержимое");
+        // цветная печать
+        let color = generated("Печать_A4_Книжная_Цветная.mxl");
+        let color_sheet = PrintJob::new(&color, 100)
+            .unwrap()
+            .render(&color, 1)
+            .unwrap();
+        assert!(!is_grayscale(&color_sheet));
+        // несуществующая страница
+        let e = job.render(&doc, 7).unwrap_err();
+        assert!(e.contains("6 стр."), "{e}");
+    }
+
+    #[test]
+    fn image_meta_writes_dpi_and_grayscale() {
+        let mut pm = render(&synthetic_doc(), 100).unwrap();
+        to_grayscale(&mut pm);
+        let meta = ImageMeta {
+            dpi: Some(150.0),
+            grayscale: true,
+        };
+        let png_bytes = encode_image(&pm, &ImageKind::PNG, DEFAULT_MAX_IMAGE_BYTES, meta).unwrap();
+        let decoder = png::Decoder::new(std::io::Cursor::new(&png_bytes));
+        let reader = decoder.read_info().unwrap();
+        let info = reader.info();
+        assert_eq!(info.color_type, png::ColorType::Grayscale);
+        let dims = info.pixel_dims.unwrap();
+        assert_eq!(dims.unit, png::Unit::Meter);
+        assert_eq!(dims.xppu, 5906); // 150 / 0.0254
+                                     // JFIF: единицы (1 = точки на дюйм) и плотность по X
+        let jpg = encode_image(
+            &pm,
+            &ImageKind::Jpeg { quality: 90 },
+            DEFAULT_MAX_IMAGE_BYTES,
+            meta,
+        )
+        .unwrap();
+        assert_eq!(&jpg[6..11], b"JFIF\0");
+        assert_eq!(jpg[13], 1);
+        assert_eq!(u16::from_be_bytes([jpg[14], jpg[15]]), 150);
+        // декодируется как картинка того же размера
+        let img = image::load_from_memory(&jpg).unwrap();
+        assert_eq!((img.width(), img.height()), (pm.width(), pm.height()));
+    }
+
+    /// Документ из одной широкой ячейки с текстом и форматом `fmt`.
+    fn single_cell_doc(text: &str, fmt: CellFormat, width_units: u32) -> Document {
+        Document {
+            formats: vec![
+                fmt,
+                CellFormat {
+                    width: Some(width_units),
+                    ..CellFormat::default()
+                },
+                CellFormat {
+                    height: Some(600),
+                    ..CellFormat::default()
+                },
+            ],
+            default_group: crate::mxl_parser::ColumnGroup {
+                columns: vec![(0, 2)],
+            },
+            rows: vec![Row {
+                index: 0,
+                format: 3,
+                cells: vec![(
+                    0,
+                    Cell {
+                        format: 1,
+                        text: Some(text.to_string()),
+                        value: None,
+                    },
+                )],
+            }],
+            ..Document::default()
+        }
+    }
+
+    /// Ограничивающий прямоугольник тёмных пикселей (x0, y0, x1, y1).
+    fn dark_bbox(pm: &Pixmap) -> (u32, u32, u32, u32) {
+        let w = pm.width();
+        let mut b = (u32::MAX, u32::MAX, 0, 0);
+        for (i, p) in pm.data().as_chunks::<4>().0.iter().enumerate() {
+            if p[0] < 128 {
+                let (x, y) = (i as u32 % w, i as u32 / w);
+                b = (b.0.min(x), b.1.min(y), b.2.max(x), b.3.max(y));
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn wrap_marks_paragraph_ends() {
+        let fonts = Fonts::load().unwrap();
+        let spec = FontSpec::default();
+        let lines = wrap_text_paragraphs(&fonts, &spec, 1.0, "раз два три четыре\nпять", 60.0);
+        let ends: Vec<bool> = lines.iter().map(|(_, e)| *e).collect();
+        assert!(lines.len() >= 3, "{lines:?}");
+        assert_eq!(ends.last(), Some(&true));
+        assert!(!ends[0], "первая строка переноса — не конец абзаца");
+        assert_eq!(ends.iter().filter(|e| **e).count(), 2, "два абзаца");
+    }
+
+    #[test]
+    fn justified_text_reaches_right_edge() {
+        let text = "Текст по ширине растягивается до правого края ячейки за счёт пробелов";
+        let fmt = |h_align| CellFormat {
+            h_align: Some(h_align),
+            v_align: Some(0),
+            text_control: Some(3),
+            ..CellFormat::default()
+        };
+        let render_first_line = |h_align| {
+            let doc = single_cell_doc(text, fmt(h_align), 200);
+            let pm = render(&doc, 100).unwrap();
+            // первая строка текста — верхние 12 px ячейки
+            let mut first = Pixmap::new(pm.width(), 14).unwrap();
+            copy_pixmap(&mut first, &pm, 0, 0);
+            let w = pm.width() as usize;
+            first.data_mut().copy_from_slice(&pm.data()[..w * 14 * 4]);
+            (dark_bbox(&first), pm.width())
+        };
+        let ((_, _, left_x1, _), width) = render_first_line(0);
+        let ((_, _, just_x1, _), _) = render_first_line(4);
+        assert!(
+            just_x1 > left_x1 + 5,
+            "по ширине {just_x1} vs влево {left_x1}"
+        );
+        assert!(
+            just_x1 + 8 >= width - 2,
+            "строка доходит до края: {just_x1} из {width}"
+        );
+    }
+
+    #[test]
+    fn rotated_text_angles() {
+        let fmt = |tenths| CellFormat {
+            orientation: Some(tenths),
+            ..CellFormat::default()
+        };
+        let bbox = |tenths| {
+            let pm = render(&single_cell_doc("Повёрнутый текст", fmt(tenths), 160), 100).unwrap();
+            let (x0, y0, x1, y1) = dark_bbox(&pm);
+            (x1 - x0, y1 - y0)
+        };
+        let (w0, h0) = bbox(0);
+        let (w180, h180) = bbox(1800);
+        assert!(
+            w180.abs_diff(w0) <= 3 && h180.abs_diff(h0) <= 3,
+            "180°: {w180}x{h180} vs {w0}x{h0}"
+        );
+        let (w270, h270) = bbox(2700);
+        assert!(h270 > w270 * 3, "270° — вертикально: {w270}x{h270}");
+        let (w45, h45) = bbox(450);
+        assert!(w45.abs_diff(h45) < w45 / 3, "45° — диагональ: {w45}x{h45}");
+        if std::env::var_os("SPREADSHEET_DUMP").is_some() {
+            for t in [0, 450, 1800, 2700] {
+                render(&single_cell_doc("Повёрнутый текст", fmt(t), 160), 100)
+                    .unwrap()
+                    .save_png(out_dir().join(format!("angle_{t}.png")))
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn cell_values_are_formatted() {
+        let doc = generated("ЗначенияЯчеек_ЧислаДаты.mxl");
+        let texts: Vec<String> = doc
+            .rows
+            .iter()
+            .flat_map(|r| r.cells.iter())
+            .filter(|(_, c)| c.value.is_some())
+            .map(|(_, c)| c.text.clone().unwrap().replace('\u{a0}', " "))
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "1 234 567,89",
+                "1 234 567,89",
+                "98 765,43",
+                "98 765,43",
+                "19.07.2026",
+                "19.07.2026"
+            ]
+        );
+        assert_eq!(doc.number_formats, ["ЧДЦ=2; ЧРД=,", "ДФ=dd.MM.yyyy"]);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "spreadsheet"
-version = "0.6.5"
+version = "0.7.3"
 edition = "2021"
 
 [lib]
@@ -11,11 +11,15 @@ native_api_1c = { path = "../native_api_1c/native_api_1c" }
 utf16_lit = "2.0" # используется кодом, который генерируют макросы native_api_1c
 tiny-skia = "0.11"
 ab_glyph = "0.2"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "pnm"] }
 arboard = "3.4"
+# быстрый JPEG-кодер (SIMD); кодирует RGBA без промежуточной копии
+jpeg-encoder = { version = "0.7", features = ["simd"] }
+# PNG напрямую: запись разрешения (pHYs) и оттенков серого
+png = "0.18"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.52", features = ["Data_Pdf", "Storage_Streams", "Foundation", "Win32_System_Com"] }
+windows = { version = "0.62", features = ["Data_Pdf", "Storage_Streams", "Foundation", "Win32_System_Com"] }
 
 [target.'cfg(not(windows))'.dependencies]
 tempfile = "3.8"
