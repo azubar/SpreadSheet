@@ -62,7 +62,13 @@ pub const MAX_DIMENSION: u32 = 65_500;
 /// около 1,75 ГБ. Без этого предела картинка 65 500 × 65 500 потребовала бы
 /// ~30 ГБ, и нехватка памяти аварийно завершила бы процесс 1С целиком
 /// (`catch_unwind` такую ошибку не перехватывает).
+#[cfg(target_pointer_width = "64")]
 pub const MAX_PIXELS: u64 = 250_000_000;
+/// В 32-битном процессе (клиент 1С x86) всё адресное пространство — 2–4 ГБ,
+/// и непрерывный блок больше нескольких сотен МБ часто не выделить: 60 Мпикс
+/// — это ~420 МБ на буфер и кодирование (например, A4 при 600 DPI — 35 Мпикс).
+#[cfg(not(target_pointer_width = "64"))]
+pub const MAX_PIXELS: u64 = 60_000_000;
 /// Предел размера закодированной картинки по умолчанию (свойство
 /// «МаксимальныйРазмерКартинки»), байт.
 pub const DEFAULT_MAX_IMAGE_BYTES: usize = 50_000_000;
@@ -89,6 +95,35 @@ pub fn check_image_size(width: u64, height: u64, hint: &str) -> Result<(), Strin
         ));
     }
     Ok(())
+}
+
+/// Выделяет буфер ёмкостью `len` байт. Нехватка памяти возвращается ошибкой,
+/// а не завершает процесс 1С аварийно, как при обычном выделении (`vec!`,
+/// `Vec::with_capacity`).
+pub fn try_buffer(len: usize) -> Result<Vec<u8>, String> {
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(len).map_err(|_| {
+        format!(
+            "недостаточно памяти для буфера изображения ({} МБ) — уменьшите Масштаб",
+            len / 1_000_000
+        )
+    })?;
+    Ok(buffer)
+}
+
+/// Белая непрозрачная картинка `width × height` (память — через
+/// [`try_buffer`]).
+pub fn white_pixmap(width: u32, height: u32) -> Result<Pixmap, String> {
+    let size = tiny_skia::IntSize::from_wh(width, height)
+        .ok_or_else(|| format!("недопустимый размер картинки {width}x{height}px"))?;
+    let len = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| format!("слишком большая картинка {width}x{height}px"))?;
+    let mut data = try_buffer(len)?;
+    // белый в премультиплицированном RGBA — все байты 255
+    data.resize(len, 255);
+    Pixmap::from_vec(data, size).ok_or_else(|| "не удалось создать буфер изображения".to_string())
 }
 
 /// Степень сжатия PNG (свойство «СжатиеPNG»).
@@ -143,6 +178,8 @@ struct Layout {
     row_y: Vec<f32>,
     ncols: u32,
     width_px: u32,
+    /// Правая граница занятой содержимым области (по всем группам колонок)
+    content_right: f32,
     height_px: u32,
     scale: f32,
 }
@@ -785,6 +822,7 @@ fn build_layout(
         row_y,
         ncols,
         width_px,
+        content_right,
         height_px,
         scale,
     })
@@ -903,8 +941,28 @@ pub fn render_page(doc: &Document, scale_percent: u32, page_number: u32) -> Resu
     let mut layout = build_layout(doc, &fonts, &prep, scale)?;
     // поле 1 px слева/сверху и 2 px справа/снизу под рамки — как у всего
     // документа
-    let x0 = layout.group_x[0][page.cols.0 as usize] - 1.0;
-    let x1 = layout.group_x[0][page.cols.1 as usize + 1] + 2.0;
+    // Границы колонок у разных групп различаются: страница охватывает
+    // колонки страницы во всех группах. Последняя по горизонтали страница
+    // ограничивается занятой содержимым шириной — как картинка всего
+    // документа (у группы по умолчанию колонки, заданные только в других
+    // группах, имеют ширину по умолчанию, и без этого справа оставалось бы
+    // пустое поле или, наоборот, обрезалось содержимое широких групп).
+    let last_col = all.iter().map(|p| p.cols.1).max().unwrap_or(0);
+    let left = layout
+        .group_x
+        .iter()
+        .map(|xs| xs[page.cols.0 as usize])
+        .fold(f32::INFINITY, f32::min);
+    let mut right = layout
+        .group_x
+        .iter()
+        .map(|xs| xs[page.cols.1 as usize + 1])
+        .fold(0.0f32, f32::max);
+    if page.cols.1 == last_col {
+        right = right.min(layout.content_right).max(left);
+    }
+    let x0 = left - 1.0;
+    let x1 = right + 2.0;
     let y0 = layout.row_y[page.rows.0 as usize] - 1.0;
     let y1 = layout.row_y[page.rows.1 as usize + 1] + 2.0;
     let (w, h) = ((x1 - x0).ceil().max(1.0), (y1 - y0).ceil().max(1.0));
@@ -929,9 +987,7 @@ fn draw_layout(
     prep: &Prepared,
     layout: &Layout,
 ) -> Result<Pixmap, String> {
-    let mut pixmap = Pixmap::new(layout.width_px, layout.height_px)
-        .ok_or_else(|| "не удалось создать буфер изображения".to_string())?;
-    pixmap.fill(tiny_skia::Color::WHITE);
+    let mut pixmap = white_pixmap(layout.width_px, layout.height_px)?;
 
     draw_backgrounds(doc, layout, prep, &mut pixmap);
     draw_borders(doc, layout, prep, &mut pixmap);
@@ -1734,25 +1790,40 @@ pub fn encode_to_vec(
 ) -> Result<Vec<u8>, String> {
     let (w, h) = (pixmap.width(), pixmap.height());
     // Pixmap хранит премультиплицированный RGBA; все этапы рендера дают
-    // непрозрачные пиксели (альфа 255), поэтому альфа просто отбрасывается.
-    let mut rgb = Vec::with_capacity(w as usize * h as usize * 3);
-    for p in pixmap.data().as_chunks::<4>().0.iter() {
-        rgb.extend_from_slice(&p[..3]);
-    }
+    // непрозрачные пиксели (альфа 255), для которых он совпадает с обычным.
     let mut out = Vec::new();
     match kind {
         ImageKind::Jpeg { quality } => {
-            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, *quality);
-            image::ImageEncoder::write_image(encoder, &rgb, w, h, image::ExtendedColorType::Rgb8)
+            // jpeg-encoder в 2–3 раза быстрее кодера из `image` при том же
+            // качестве и размере файла и кодирует RGBA напрямую (альфа
+            // отбрасывается) — без промежуточной RGB-копии. Субдискретизация
+            // цвета отключена (4:4:4, как у прежнего кодера): с 4:2:0 файл
+            // меньше, но расплывается цветной текст и тонкие цветные рамки.
+            let mut encoder = jpeg_encoder::Encoder::new(&mut out, *quality);
+            encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
+            encoder
+                .encode(
+                    pixmap.data(),
+                    w as u16,
+                    h as u16,
+                    jpeg_encoder::ColorType::Rgba,
+                )
                 .map_err(|e| format!("ошибка кодирования JPEG: {e}"))?;
         }
         ImageKind::Png { compression } => {
             use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+            // Уровни подобраны замером на документах: уровень 1 почти так же
+            // быстр, как Fast (fdeflate), но файл в 2–4 раза меньше; уровень 4
+            // даёт размер как у Default (≈ уровень 6) вдвое быстрее.
             let compression = match compression {
-                PngCompression::Fast => CompressionType::Fast,
-                PngCompression::Default => CompressionType::Default,
+                PngCompression::Fast => CompressionType::Level(1),
+                PngCompression::Default => CompressionType::Level(4),
                 PngCompression::Best => CompressionType::Best,
             };
+            let mut rgb = try_buffer(w as usize * h as usize * 3)?;
+            for p in pixmap.data().as_chunks::<4>().0.iter() {
+                rgb.extend_from_slice(&p[..3]);
+            }
             let encoder = PngEncoder::new_with_quality(&mut out, compression, FilterType::Adaptive);
             image::ImageEncoder::write_image(encoder, &rgb, w, h, image::ExtendedColorType::Rgb8)
                 .map_err(|e| format!("ошибка кодирования PNG: {e}"))?;
@@ -1760,8 +1831,10 @@ pub fn encode_to_vec(
     }
     if out.len() > max_bytes {
         let hint = match kind {
-            ImageKind::Jpeg { .. } => "уменьшите Масштаб или Качество",
-            ImageKind::Png { .. } => "уменьшите Масштаб, выберите JPEG или СжатиеPNG = 2",
+            ImageKind::Jpeg { .. } => {
+                "уменьшите Масштаб или Качество (для документов с текстом PNG обычно меньше JPEG)"
+            }
+            ImageKind::Png { .. } => "уменьшите Масштаб или задайте СжатиеPNG = 2",
         };
         return Err(format!(
             "слишком большая картинка: {} МБ (предел МаксимальныйРазмерКартинки — {} МБ) — \
@@ -2718,5 +2791,69 @@ mod tests {
         assert!((60..=200).contains(&v), "ожидался серый, получено {v}");
         // за пределами картинки — фон
         assert_eq!(pm.data()[0], 255);
+    }
+
+    /// Документ с дополнительной группой колонок шире группы по умолчанию:
+    /// строка 0 — в группе по умолчанию (2 узкие колонки), строка 1 — в
+    /// дополнительной группе (6 широких колонок, текст в последней).
+    fn doc_with_wide_extra_group() -> Document {
+        let text = |t: &str| Cell {
+            format: 0,
+            text: Some(t.to_string()),
+        };
+        Document {
+            formats: vec![
+                CellFormat {
+                    width: Some(10),
+                    ..CellFormat::default()
+                },
+                CellFormat {
+                    width: Some(100),
+                    ..CellFormat::default()
+                },
+            ],
+            default_group: crate::mxl_parser::ColumnGroup {
+                columns: vec![(0, 1), (1, 1)],
+            },
+            extra_groups: vec![crate::mxl_parser::ColumnGroup {
+                columns: (0..6).map(|c| (c, 2)).collect(),
+            }],
+            row_groups: vec![(1, 0)],
+            rows: vec![
+                Row {
+                    index: 0,
+                    format: 0,
+                    cells: vec![(1, text("узкая"))],
+                },
+                Row {
+                    index: 1,
+                    format: 0,
+                    cells: vec![(5, text("широкая"))],
+                },
+            ],
+            ..Document::default()
+        }
+    }
+
+    #[test]
+    fn page_of_document_with_extra_column_group_matches_full_render() {
+        let doc = doc_with_wide_extra_group();
+        let full = render(&doc, 100).unwrap();
+        let page = render_page(&doc, 100, 1).unwrap();
+        assert_eq!(
+            (page.width(), page.height()),
+            (full.width(), full.height()),
+            "единственная страница должна совпадать с документом целиком"
+        );
+        assert!(page.data() == full.data());
+    }
+
+    #[test]
+    fn white_pixmap_and_buffer_limits() {
+        let p = white_pixmap(3, 2).unwrap();
+        assert!(p.data().iter().all(|&b| b == 255));
+        assert!(white_pixmap(0, 5).is_err());
+        let e = try_buffer(usize::MAX).unwrap_err();
+        assert!(e.contains("недостаточно памяти"), "{e}");
     }
 }

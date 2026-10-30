@@ -1,0 +1,7 @@
+# Версия Rust закреплена: новые версии clippy добавляют правила, из-за
+# которых CI с `-D warnings` может внезапно упасть без изменений в коде.
+# Обновлять осознанно: поднять версию здесь и в .github/workflows/*.yml.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

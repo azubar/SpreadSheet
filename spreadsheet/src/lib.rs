@@ -541,9 +541,7 @@ fn apply_margins(pixmap: tiny_skia::Pixmap, margins: u32) -> Result<tiny_skia::P
     let w = pixmap.width() as u64 + 2 * margins as u64;
     let h = pixmap.height() as u64 + 2 * margins as u64;
     converter::check_image_size(w, h, "уменьшите ПоляКартинки или Масштаб")?;
-    let mut result = tiny_skia::Pixmap::new(w as u32, h as u32)
-        .ok_or_else(|| "не удалось создать буфер изображения для полей".to_string())?;
-    result.fill(tiny_skia::Color::WHITE);
+    let mut result = converter::white_pixmap(w as u32, h as u32)?;
     converter::copy_pixmap(&mut result, &pixmap, margins, margins);
     Ok(result)
 }

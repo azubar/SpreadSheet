@@ -1215,7 +1215,12 @@ fn parse_tail(root: &[Value], rows_end: usize, doc: &mut Document) {
 
 /// Предел размера входного файла: файл читается в память целиком, и дерево
 /// значений занимает кратно больше самого файла.
+#[cfg(target_pointer_width = "64")]
 pub const MAX_FILE_SIZE: u64 = 200 * 1024 * 1024;
+/// В 32-битном процессе дерево значений файла в 200 МБ (в разы больше самого
+/// файла) не помещается в адресное пространство.
+#[cfg(not(target_pointer_width = "64"))]
+pub const MAX_FILE_SIZE: u64 = 40 * 1024 * 1024;
 
 /// Читает и разбирает файл *.mxl (формат 1С 8.х).
 pub fn parse_file(path: &Path) -> Result<Document, MxlError> {

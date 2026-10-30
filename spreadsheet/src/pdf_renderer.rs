@@ -31,7 +31,7 @@ impl PdfInput<'_> {
     }
 }
 
-use crate::converter::{check_image_size, copy_pixmap};
+use crate::converter::{check_image_size, copy_pixmap, white_pixmap};
 
 /// Подсказка в сообщениях о слишком большой картинке PDF.
 const PDF_SIZE_HINT: &str =
@@ -88,9 +88,7 @@ fn stack_pages(pages: &[tiny_skia::Pixmap], spacing: u32) -> Result<tiny_skia::P
     let max_w = pages.iter().map(|p| p.width()).max().unwrap_or(0);
     let total_h =
         pages.iter().map(|p| p.height()).sum::<u32>() + spacing * (pages.len() as u32 - 1);
-    let mut result = tiny_skia::Pixmap::new(max_w, total_h)
-        .ok_or_else(|| "не удалось создать буфер изображения PDF".to_string())?;
-    result.fill(tiny_skia::Color::WHITE);
+    let mut result = white_pixmap(max_w, total_h)?;
     let mut y = 0u32;
     for page in pages {
         copy_pixmap(&mut result, page, (max_w - page.width()) / 2, y);
@@ -103,8 +101,7 @@ fn stack_pages(pages: &[tiny_skia::Pixmap], spacing: u32) -> Result<tiny_skia::P
 /// Pixmap, накладывая полупрозрачные пиксели на белый фон. Дальнейшие этапы
 /// (кодирование, буфер обмена) рассчитывают на альфу 255 во всех пикселях.
 fn rgba_to_opaque_pixmap(rgba: &image::RgbaImage) -> Result<tiny_skia::Pixmap, String> {
-    let mut pixmap = tiny_skia::Pixmap::new(rgba.width(), rgba.height())
-        .ok_or_else(|| "не удалось создать буфер изображения страницы PDF".to_string())?;
+    let mut pixmap = white_pixmap(rgba.width(), rgba.height())?;
     for (dst, src) in pixmap
         .data_mut()
         .as_chunks_mut::<4>()
